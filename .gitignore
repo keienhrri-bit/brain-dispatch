@@ -1,0 +1,5 @@
+node_modules/
+.brain-dispatch/
+*.log
+.DS_Store
+Thumbs.db

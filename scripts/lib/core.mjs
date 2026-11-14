@@ -1,0 +1,1130 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+export const DEFAULT_CONFIG = Object.freeze({
+  worker: Object.freeze({
+    model: 'gemini-4-hydrogen',
+    effort: 'high',
+    timeoutMin: 20,
+  }),
+  protect: Object.freeze([]),
+  proxy: null,
+  agy: null,
+  policyHook: true,
+});
+
+export const VALID_ACCESS = Object.freeze(['read', 'write', 'full']);
+export const VALID_EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh']);
+export const PROMPT_INLINE_LIMIT = 12000;
+export const DEFAULT_KILL_GRACE_SEC = 60;
+
+export const CMD_DENY_PATTERNS = Object.freeze([
+  'regex:(?i).*\\b(Remove-Item|rm|del|erase|rmdir|rd|ri|Clear-Content|Clear-RecycleBin)\\b.*',
+  'regex:(?i).*\\b(curl|wget|Invoke-WebRequest|iwr|Invoke-RestMethod|irm|Start-BitsTransfer|ssh|scp|ftp)\\b.*',
+  'regex:(?i).*\\bgit\\s+(push|reset|clean|restore)\\b.*',
+  'regex:(?i).*\\b(shutdown|Restart-Computer|Stop-Computer|schtasks|Register-ScheduledTask|Set-ExecutionPolicy|diskpart|Stop-Process|taskkill|Start-Process|winget|choco|agy|codex|claude|grok|gemini|opencode)\\b.*',
+  'regex:(?i).*\\b(reg\\s+(add|delete|import)|format\\s+[a-z]:|pip\\s+install|npm\\s+(i|install)\\s+(-g|--global))\\b.*',
+  'regex:(?i).*\\b(sudo|su|chmod|chown|chgrp|dd|mkfs|mount|umount|kill|pkill|killall|nc|ncat|telnet|rsync|sftp|unlink|shred|brew|apt|apt-get|yum|dnf|pacman|snap|launchctl|systemctl|crontab|osascript)\\b.*',
+]);
+
+export class ValidationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ValidationError';
+  }
+}
+
+export class BackendUnavailableError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'BackendUnavailableError';
+  }
+}
+
+export function stripBom(text) {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+export function isCaseInsensitivePlatform(platform = process.platform) {
+  return platform === 'win32' || platform === 'darwin';
+}
+
+export function toSlash(p) {
+  return String(p).replace(/\\/g, '/');
+}
+
+export function expandHome(p, homeDir = os.homedir()) {
+  const s = String(p);
+  if (s === '~') return homeDir;
+  if (s.startsWith('~/') || s.startsWith('~\\')) {
+    return path.join(homeDir, s.slice(2));
+  }
+  return s;
+}
+
+export function normalizePath(p, platform = process.platform, cwd = process.cwd()) {
+  const pathMod = platform === 'win32' ? path.win32 : path.posix;
+  const resolved = pathMod.resolve(cwd, String(p));
+  const parsed = pathMod.parse(resolved);
+  if (resolved === parsed.root) {
+    return resolved;
+  }
+  return resolved.replace(/[\\/]+$/, '');
+}
+
+export function pathKey(p, platform = process.platform) {
+  const normalized = toSlash(p);
+  return isCaseInsensitivePlatform(platform) ? normalized.toLowerCase() : normalized;
+}
+
+export function isSamePath(a, b, platform = process.platform, cwd = process.cwd()) {
+  return (
+    pathKey(normalizePath(a, platform, cwd), platform) ===
+    pathKey(normalizePath(b, platform, cwd), platform)
+  );
+}
+
+export function isInside(child, parent, platform = process.platform, cwd = process.cwd()) {
+  const c = toSlash(normalizePath(child, platform, cwd));
+  const p = toSlash(normalizePath(parent, platform, cwd));
+  const cSlash = c.endsWith('/') ? c : `${c}/`;
+  const pSlash = p.endsWith('/') ? p : `${p}/`;
+  return pathKey(cSlash, platform).startsWith(pathKey(pSlash, platform));
+}
+
+export function uniquePaths(paths, platform = process.platform, cwd = process.cwd()) {
+  const seen = new Set();
+  const out = [];
+  for (const item of paths) {
+    const norm = normalizePath(item, platform, cwd);
+    const key = pathKey(norm, platform);
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(norm);
+    }
+  }
+  return out;
+}
+
+export function splitList(values) {
+  const out = [];
+  for (const v of values) {
+    if (typeof v !== 'string') continue;
+    for (const part of v.split(',')) {
+      const trimmed = part.trim();
+      if (trimmed) out.push(trimmed);
+    }
+  }
+  return out;
+}
+
+export function limitText(text, maxLen) {
+  const collapsed = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (collapsed.length > maxLen) {
+    return `${collapsed.slice(0, maxLen)}...`;
+  }
+  return collapsed;
+}
+
+export function getStateHome(
+  env = process.env,
+  homeDir = os.homedir(),
+  platform = process.platform,
+  cwd = process.cwd()
+) {
+  const pathMod = platform === 'win32' ? path.win32 : path.posix;
+  const custom = env.BRAIN_DISPATCH_HOME?.trim();
+  if (custom) {
+    return normalizePath(expandHome(custom, homeDir), platform, cwd);
+  }
+  return normalizePath(pathMod.join(homeDir, '.brain-dispatch'), platform, homeDir);
+}
+
+export function mergeConfig(raw) {
+  const obj = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const workerRaw = obj.worker && typeof obj.worker === 'object' && !Array.isArray(obj.worker)
+    ? obj.worker
+    : {};
+
+  return {
+    ...obj,
+    worker: {
+      model:
+        typeof workerRaw.model === 'string' && workerRaw.model.trim()
+          ? workerRaw.model.trim()
+          : DEFAULT_CONFIG.worker.model,
+      effort:
+        typeof workerRaw.effort === 'string' && workerRaw.effort.trim()
+          ? workerRaw.effort.trim()
+          : DEFAULT_CONFIG.worker.effort,
+      timeoutMin:
+        typeof workerRaw.timeoutMin === 'number' &&
+        Number.isFinite(workerRaw.timeoutMin) &&
+        workerRaw.timeoutMin > 0
+          ? workerRaw.timeoutMin
+          : DEFAULT_CONFIG.worker.timeoutMin,
+    },
+    protect: Array.isArray(obj.protect)
+      ? obj.protect.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim())
+      : [],
+    proxy: typeof obj.proxy === 'string' && obj.proxy.trim() ? obj.proxy.trim() : null,
+    agy: typeof obj.agy === 'string' && obj.agy.trim() ? obj.agy.trim() : null,
+    policyHook: typeof obj.policyHook === 'boolean' ? obj.policyHook : DEFAULT_CONFIG.policyHook,
+  };
+}
+
+export function loadConfig(stateHome) {
+  const configPath = path.join(stateHome, 'config.json');
+  if (!fs.existsSync(configPath)) {
+    return { exists: false, path: configPath, config: mergeConfig({}) };
+  }
+  let parsed;
+  try {
+    const raw = stripBom(fs.readFileSync(configPath, 'utf8'));
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new ValidationError(`Invalid JSON in config file ${configPath}: ${err.message}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ValidationError(`Config file ${configPath} must contain a JSON object`);
+  }
+  return { exists: true, path: configPath, config: mergeConfig(parsed) };
+}
+
+export function validateName(name) {
+  if (typeof name !== 'string' || !/^[\p{L}\p{N}_-]+$/u.test(name)) {
+    throw new ValidationError(
+      `Invalid --name "${name ?? ''}": only letters, digits, '_' and '-' are allowed`
+    );
+  }
+}
+
+export function parseWorkerArgs(argv, config = mergeConfig({})) {
+  const opts = {
+    name: null,
+    task: null,
+    workdir: null,
+    readDirs: [],
+    writeDirs: [],
+    protect: [],
+    access: 'write',
+    effort: config.worker.effort,
+    model: null,
+    web: false,
+    timeoutMin: config.worker.timeoutMin,
+    dryRun: false,
+    help: false,
+  };
+
+  const valueFlags = new Set([
+    '--name',
+    '--task',
+    '--workdir',
+    '--read-dir',
+    '--write-dir',
+    '--protect',
+    '--access',
+    '--effort',
+    '--model',
+    '--timeout-min',
+  ]);
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === '--help' || token === '-h') {
+      opts.help = true;
+      return opts;
+    }
+    if (token === '--web') {
+      opts.web = true;
+      continue;
+    }
+    if (token === '--dry-run') {
+      opts.dryRun = true;
+      continue;
+    }
+
+    let flag = token;
+    let val = null;
+    const eqIdx = token.indexOf('=');
+    if (eqIdx > 0 && token.startsWith('--')) {
+      flag = token.slice(0, eqIdx);
+      val = token.slice(eqIdx + 1);
+    }
+
+    if (!valueFlags.has(flag)) {
+      throw new ValidationError(`Unknown or unexpected argument: ${token}`);
+    }
+
+    if (val === null) {
+      if (i + 1 >= argv.length) {
+        throw new ValidationError(`Missing value for ${flag}`);
+      }
+      val = argv[i + 1];
+      i += 1;
+    }
+
+    switch (flag) {
+      case '--name':
+        opts.name = val;
+        break;
+      case '--task':
+        opts.task = val;
+        break;
+      case '--workdir':
+        opts.workdir = val;
+        break;
+      case '--read-dir':
+        opts.readDirs.push(val);
+        break;
+      case '--write-dir':
+        opts.writeDirs.push(val);
+        break;
+      case '--protect':
+        opts.protect.push(val);
+        break;
+      case '--access':
+        opts.access = val;
+        break;
+      case '--effort':
+        opts.effort = val;
+        break;
+      case '--model':
+        opts.model = val;
+        break;
+      case '--timeout-min': {
+        const num = Number(val);
+        if (!val.trim() || !Number.isFinite(num) || num <= 0) {
+          throw new ValidationError(`Invalid --timeout-min "${val}": must be a positive number`);
+        }
+        opts.timeoutMin = num;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  if (!opts.name) throw new ValidationError('Missing required argument: --name');
+  validateName(opts.name);
+  if (!opts.task) throw new ValidationError('Missing required argument: --task');
+  if (!opts.workdir) throw new ValidationError('Missing required argument: --workdir');
+
+  if (!VALID_ACCESS.includes(opts.access)) {
+    throw new ValidationError(
+      `Invalid --access "${opts.access}": expected one of ${VALID_ACCESS.join(', ')}`
+    );
+  }
+  if (!VALID_EFFORTS.includes(opts.effort)) {
+    throw new ValidationError(
+      `Invalid --effort "${opts.effort}": expected one of ${VALID_EFFORTS.join(', ')}`
+    );
+  }
+  if (opts.model !== null && !opts.model.trim()) {
+    throw new ValidationError('Invalid --model: value cannot be empty');
+  }
+
+  opts.readDirs = splitList(opts.readDirs);
+  opts.writeDirs = splitList(opts.writeDirs);
+  opts.protect = splitList(opts.protect);
+  opts.resolvedModel = opts.model
+    ? opts.model.trim()
+    : `${config.worker.model}-${opts.effort}`;
+
+  return opts;
+}
+
+export function getHardProtectedDirs({
+  homeDir = os.homedir(),
+  stateHome,
+  platform = process.platform,
+}) {
+  const pathMod = platform === 'win32' ? path.win32 : path.posix;
+  const relDirs = [
+    '.claude',
+    '.codex',
+    '.gemini',
+    '.grok',
+    '.ssh',
+    '.aws',
+    '.gnupg',
+    '.kube',
+    pathMod.join('.config', 'gh'),
+  ];
+  const resolvedStateHome = stateHome ?? getStateHome({}, homeDir, platform);
+  return uniquePaths(
+    [...relDirs.map((rel) => pathMod.join(homeDir, rel)), resolvedStateHome],
+    platform,
+    homeDir
+  );
+}
+
+export function validateDirectories({
+  workDir,
+  writeDirs = [],
+  readDirs = [],
+  configProtect = [],
+  cliProtect = [],
+  access = 'write',
+  homeDir = os.homedir(),
+  stateHome,
+  platform = process.platform,
+  cwd = process.cwd(),
+}) {
+  const normWorkDir = normalizePath(expandHome(workDir, homeDir), platform, cwd);
+  const normWriteDirs = uniquePaths(
+    writeDirs.map((d) => expandHome(d, homeDir)),
+    platform,
+    cwd
+  );
+  const normReadDirs = uniquePaths(
+    readDirs.map((d) => expandHome(d, homeDir)),
+    platform,
+    cwd
+  );
+  const normProtect = uniquePaths(
+    [
+      ...getHardProtectedDirs({ homeDir, stateHome, platform }),
+      ...configProtect.map((d) => expandHome(d, homeDir)),
+      ...cliProtect.map((d) => expandHome(d, homeDir)),
+    ],
+    platform,
+    cwd
+  );
+
+  const writable =
+    access === 'read' ? [] : uniquePaths([normWorkDir, ...normWriteDirs], platform, cwd);
+
+  for (const w of writable) {
+    for (const p of normProtect) {
+      if (isInside(w, p, platform, cwd)) {
+        throw new ValidationError(
+          `Protected directory cannot be writable: ${toSlash(w)} (inside ${toSlash(p)})`
+        );
+      }
+    }
+    for (const r of normReadDirs) {
+      if (isInside(w, r, platform, cwd)) {
+        throw new ValidationError(
+          `Read-only directory ${toSlash(r)} encloses writable directory ${toSlash(w)}, which would block writes; pass a more specific subdirectory to --read-dir`
+        );
+      }
+    }
+  }
+
+  const writeDeny = uniquePaths([...normProtect, ...normReadDirs], platform, cwd);
+
+  return {
+    workDir: normWorkDir,
+    writeDirs: normWriteDirs,
+    readDirs: normReadDirs,
+    writable,
+    protectedDirs: normProtect,
+    writeDeny,
+  };
+}
+
+export function buildSettings({ access, web, writeDeny = [] }) {
+  const allow = ['read_file(*)'];
+  const deny = ['execute_url(*)'];
+
+  if (web) {
+    allow.push('read_url(*)');
+    deny.push('mcp(*)');
+  } else {
+    deny.push('mcp(*)', 'read_url(*)');
+  }
+
+  switch (access) {
+    case 'read':
+      deny.push('write_file(*)', 'command(*)', 'unsandboxed(*)');
+      break;
+    case 'write':
+      deny.push('command(*)', 'unsandboxed(*)');
+      for (const dir of writeDeny) {
+        deny.push(`write_file(${toSlash(dir)})`);
+      }
+      break;
+    case 'full':
+      allow.push('command(*)', 'unsandboxed(*)');
+      for (const pattern of CMD_DENY_PATTERNS) {
+        deny.push(`command(${pattern})`, `unsandboxed(${pattern})`);
+      }
+      for (const dir of writeDeny) {
+        deny.push(`write_file(${toSlash(dir)})`);
+      }
+      break;
+    default:
+      throw new ValidationError(`Unsupported access level: ${access}`);
+  }
+
+  return {
+    allowNonWorkspaceAccess: false,
+    permissions: {
+      allow,
+      deny,
+    },
+  };
+}
+
+export function renderPrompt({ template, taskText, workDir, writable, readDirs, access, web }) {
+  const formatBullets = (list, emptyText) =>
+    list.length > 0
+      ? list.map((dir) => `  - \`${toSlash(dir)}\``).join('\n')
+      : `  - ${emptyText}`;
+
+  const cmdTextByAccess = {
+    read: 'You cannot run any command.',
+    write:
+      'You cannot run any command; to process data, read and write files directly. If the job truly cannot be finished without running a script, report `blocked` and say in `open` what needs to run.',
+    full:
+      'You may run commands, operating only inside the working directory. Install nothing globally. Commands that delete files, download from the network, push or reset git history, change system settings or start another agent are blocked; if one is blocked, find another way or put it in `open`. Do not work around the block.',
+  };
+
+  const webText = web
+    ? 'You may search the web and read URLs. Attach the link to every piece of information taken from the web.'
+    : 'No web access. If you need information from the web, put it in `open`.';
+
+  const head = template
+    .split('{{WORKDIR}}')
+    .join(toSlash(workDir))
+    .split('{{WRITABLE}}')
+    .join(formatBullets(writable, '(none; this job is read-only)'))
+    .split('{{READONLY}}')
+    .join(formatBullets(readDirs, '(none listed; everything else on this machine is readable but not writable)'))
+    .split('{{CMD}}')
+    .join(cmdTextByAccess[access])
+    .split('{{WEB}}')
+    .join(webText);
+
+  return head + taskText;
+}
+
+export function selectPromptArg(prompt, promptFilePath) {
+  if (prompt.length > PROMPT_INLINE_LIMIT) {
+    return `First read the full brief with your file-read tool at ${toSlash(promptFilePath)}, then follow its protocol and task exactly. If you cannot read it, report blocked.`;
+  }
+  return prompt;
+}
+
+export function buildBackendArgs({
+  promptArg,
+  model,
+  settingsFile,
+  schemaFile,
+  timeoutMin,
+  access,
+  workDir,
+  writeDirs = [],
+  readDirs = [],
+  platform = process.platform,
+}) {
+  const timeoutSec = Math.max(1, Math.round(timeoutMin * 60));
+  const argv = [
+    '-p',
+    promptArg,
+    '--model',
+    model,
+    '--settings',
+    settingsFile,
+    '--output-format',
+    'json',
+    '--json-schema',
+    schemaFile,
+    '--print-timeout',
+    `${timeoutSec}s`,
+    '--disable-slash-commands',
+  ];
+
+  if (access !== 'read') {
+    argv.push('--mode', 'accept-edits');
+  }
+
+  for (const dir of uniquePaths([...writeDirs, ...readDirs], platform)) {
+    if (!isSamePath(dir, workDir, platform)) {
+      argv.push('--add-dir', dir);
+    }
+  }
+
+  return argv;
+}
+
+export function findBackend(
+  config = mergeConfig({}),
+  env = process.env,
+  platform = process.platform,
+  fsOps = {}
+) {
+  const isFile =
+    fsOps.isFile ??
+    ((p) => {
+      try {
+        return fs.statSync(p).isFile();
+      } catch {
+        return false;
+      }
+    });
+  const isExecutable =
+    fsOps.isExecutable ??
+    ((p) => {
+      if (!isFile(p)) return false;
+      if (platform === 'win32') return true;
+      try {
+        fs.accessSync(p, fs.constants.X_OK);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+
+  const envCmd = env.BRAIN_DISPATCH_AGY_CMD?.trim();
+  if (envCmd) {
+    let parsed;
+    try {
+      parsed = JSON.parse(envCmd);
+    } catch (err) {
+      throw new BackendUnavailableError(
+        `Invalid JSON in BRAIN_DISPATCH_AGY_CMD: ${err.message}`
+      );
+    }
+    if (
+      !Array.isArray(parsed) ||
+      parsed.length === 0 ||
+      !parsed.every((item) => typeof item === 'string' && item.length > 0)
+    ) {
+      throw new BackendUnavailableError(
+        'BRAIN_DISPATCH_AGY_CMD must be a non-empty JSON array of strings'
+      );
+    }
+    return {
+      command: parsed[0],
+      argsPrefix: parsed.slice(1),
+      source: 'env',
+    };
+  }
+
+  if (config.agy) {
+    const candidate = expandHome(config.agy, os.homedir());
+    if (isExecutable(candidate)) {
+      return {
+        command: candidate,
+        argsPrefix: [],
+        source: 'config',
+      };
+    }
+  }
+
+  const pathMod = platform === 'win32' ? path.win32 : path.posix;
+  const exeName = platform === 'win32' ? 'agy.exe' : 'agy';
+  const pathEnv = env.PATH || env.Path || '';
+  const pathDirs = pathEnv
+    .split(platform === 'win32' ? ';' : ':')
+    .map((d) => d.trim().replace(/^"(.*)"$/, '$1'))
+    .filter(Boolean);
+
+  for (const dir of pathDirs) {
+    const candidate = pathMod.join(dir, exeName);
+    if (isExecutable(candidate)) {
+      return {
+        command: candidate,
+        argsPrefix: [],
+        source: 'path',
+      };
+    }
+  }
+
+  if (platform === 'win32' && env.LOCALAPPDATA) {
+    const fallback = pathMod.join(env.LOCALAPPDATA, 'agy', 'bin', 'agy.exe');
+    if (isExecutable(fallback)) {
+      return {
+        command: fallback,
+        argsPrefix: [],
+        source: 'localappdata',
+      };
+    }
+  }
+
+  throw new BackendUnavailableError(
+    "Antigravity CLI (agy) not found. Install Antigravity CLI and run 'agy' once to sign in."
+  );
+}
+
+export function formatJobStamp(date = new Date()) {
+  const pad2 = (n) => String(n).padStart(2, '0');
+  return (
+    `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}-` +
+    `${pad2(date.getHours())}${pad2(date.getMinutes())}${pad2(date.getSeconds())}`
+  );
+}
+
+export function formatLocalIso(date = new Date()) {
+  const pad2 = (n) => String(n).padStart(2, '0');
+  return (
+    `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}T` +
+    `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
+  );
+}
+
+export function takeSnapshot(dirs, platform = process.platform) {
+  const snap = new Map();
+
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === '.git' || entry.name === 'node_modules') continue;
+        walk(fullPath);
+      } else if (entry.isFile()) {
+        try {
+          const st = fs.statSync(fullPath, { bigint: true });
+          const norm = normalizePath(fullPath, platform);
+          const key = pathKey(norm, platform);
+          snap.set(key, { path: norm, sig: `${st.size}|${st.mtimeNs}` });
+        } catch {
+          // Ignore unreadable or transient files
+        }
+      }
+    }
+  };
+
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue;
+    walk(dir);
+  }
+
+  return snap;
+}
+
+export function diffSnapshots(before, after) {
+  const created = [];
+  const modified = [];
+  const deleted = [];
+
+  for (const [key, entry] of after.entries()) {
+    const prev = before.get(key);
+    if (!prev) {
+      created.push(entry.path);
+    } else if (prev.sig !== entry.sig) {
+      modified.push(entry.path);
+    }
+  }
+
+  for (const [key, entry] of before.entries()) {
+    if (!after.has(key)) {
+      deleted.push(entry.path);
+    }
+  }
+
+  created.sort();
+  modified.sort();
+  deleted.sort();
+  return { created, modified, deleted };
+}
+
+export function diffReadOnly(beforeRO, afterRO) {
+  const touched = new Map();
+  for (const [key, entry] of afterRO.entries()) {
+    const prev = beforeRO.get(key);
+    if (!prev || prev.sig !== entry.sig) {
+      touched.set(key, entry.path);
+    }
+  }
+  for (const [key, entry] of beforeRO.entries()) {
+    if (!afterRO.has(key)) {
+      touched.set(key, entry.path);
+    }
+  }
+  return [...touched.values()].sort();
+}
+
+export function resolveClaimedPath(rawPath, workDir, platform = process.platform) {
+  let p = String(rawPath ?? '').trim();
+  if (!p) return null;
+
+  if (/^file:\/\//i.test(p)) {
+    if (platform === process.platform) {
+      try {
+        p = fileURLToPath(p);
+      } catch {
+        p = decodeURIComponent(p.replace(/^file:\/\/\/(?=[a-zA-Z]:)/i, '').replace(/^file:\/\//i, ''));
+      }
+    } else if (platform === 'win32') {
+      p = decodeURIComponent(p.replace(/^file:\/\/\//i, ''));
+    } else {
+      p = decodeURIComponent(p.replace(/^file:\/\//i, ''));
+    }
+  }
+
+  const pathMod = platform === 'win32' ? path.win32 : path.posix;
+  if (!pathMod.isAbsolute(p)) {
+    p = pathMod.join(workDir, p);
+  }
+  return normalizePath(p, platform, workDir);
+}
+
+export function reconcileReport({
+  report,
+  created,
+  modified,
+  workDir,
+  platform = process.platform,
+  existsSync = fs.existsSync,
+}) {
+  const claimed = new Map();
+  if (report && Array.isArray(report.files)) {
+    for (const item of report.files) {
+      if (!item || typeof item.path !== 'string' || !item.path.trim()) continue;
+      const resolved = resolveClaimedPath(item.path, workDir, platform);
+      if (!resolved) continue;
+      claimed.set(pathKey(resolved, platform), {
+        path: resolved,
+        what: typeof item.what === 'string' ? item.what : '',
+      });
+    }
+  }
+
+  const missing = [];
+  for (const entry of claimed.values()) {
+    if (!existsSync(entry.path)) {
+      missing.push(entry.path);
+    }
+  }
+  missing.sort();
+
+  const changed = [...created, ...modified];
+  const unreported = changed.filter((p) => !claimed.has(pathKey(p, platform)));
+
+  return { claimed, missing, unreported };
+}
+
+export function validateReportSchema(rep) {
+  if (!rep || typeof rep !== 'object' || Array.isArray(rep)) {
+    return 'report must be a JSON object';
+  }
+  const requiredKeys = ['status', 'summary', 'files', 'findings', 'verified', 'unverified', 'open'];
+  const allowedKeys = new Set(requiredKeys);
+  for (const k of Object.keys(rep)) {
+    if (!allowedKeys.has(k)) {
+      return `unexpected property "${k}"`;
+    }
+  }
+  for (const k of requiredKeys) {
+    if (!(k in rep)) {
+      return `missing required property "${k}"`;
+    }
+  }
+  if (!['done', 'partial', 'blocked'].includes(rep.status)) {
+    return `invalid status "${rep.status}"`;
+  }
+  if (typeof rep.summary !== 'string') {
+    return 'summary must be a string';
+  }
+  if (!Array.isArray(rep.files)) {
+    return 'files must be an array';
+  }
+  for (let i = 0; i < rep.files.length; i += 1) {
+    const f = rep.files[i];
+    if (!f || typeof f !== 'object' || Array.isArray(f)) {
+      return `files[${i}] must be an object`;
+    }
+    const fKeys = Object.keys(f);
+    if (fKeys.some((k) => k !== 'path' && k !== 'what')) {
+      return `files[${i}] contains unexpected property`;
+    }
+    if (typeof f.path !== 'string' || typeof f.what !== 'string') {
+      return `files[${i}] must have string path and what`;
+    }
+  }
+  for (const arrKey of ['findings', 'verified', 'unverified', 'open']) {
+    if (!Array.isArray(rep[arrKey]) || rep[arrKey].some((x) => typeof x !== 'string')) {
+      return `${arrKey} must be an array of strings`;
+    }
+  }
+  return null;
+}
+
+export function parseBackendOutput(stdout) {
+  let rawObj = null;
+  const text = String(stdout ?? '');
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      rawObj = parsed;
+    }
+  } catch {
+    const lines = text.split(/\r?\n/).filter((line) => line.trimStart().startsWith('{'));
+    const last = lines[lines.length - 1];
+    if (last) {
+      try {
+        const parsed = JSON.parse(last);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          rawObj = parsed;
+        }
+      } catch {
+        // Ignore unparseable line
+      }
+    }
+  }
+
+  const status = rawObj ? (rawObj.status != null ? String(rawObj.status) : '') : 'UNPARSED';
+  const usage = rawObj?.usage ?? null;
+  const conversationId = rawObj?.conversation_id ?? null;
+  const deniedSet = new Set();
+  if (Array.isArray(rawObj?.denied_actions)) {
+    for (const item of rawObj.denied_actions) {
+      if (item && typeof item.action === 'string' && item.action.trim()) {
+        deniedSet.add(item.action);
+      }
+    }
+  }
+  const denied = [...deniedSet];
+  const respText = rawObj?.response != null ? String(rawObj.response) : '';
+
+  let rep = rawObj?.structured_output ?? null;
+  if (!rep && respText) {
+    const start = respText.indexOf('{');
+    const end = respText.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try {
+        const cand = JSON.parse(respText.slice(start, end + 1));
+        if (cand && typeof cand === 'object' && cand.status && cand.summary != null) {
+          rep = cand;
+        }
+      } catch {
+        // Ignore non-JSON braces in response text
+      }
+    }
+  }
+
+  const repError = rep ? validateReportSchema(rep) : null;
+
+  return {
+    rawObj,
+    status,
+    usage,
+    conversationId,
+    denied,
+    respText,
+    rep,
+    repError,
+  };
+}
+
+export function judgeRun({
+  timedOut,
+  timeoutMin,
+  code,
+  stderr,
+  stdout,
+  parsed,
+  missing = [],
+  roTouched = [],
+  elapsedSec = null,
+}) {
+  const errLines = String(stderr ?? '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const errHead = errLines.slice(0, 3).join(' / ');
+  const combined = `${stderr ?? ''}\n${stdout ?? ''}`;
+  const validRep = parsed.rep && !parsed.repError ? parsed.rep : null;
+
+  if (timedOut) {
+    return { exit: 4, reason: `Timed out (${timeoutMin} min)` };
+  }
+  if (/authentication required|not logged in|login required/i.test(stderr ?? '')) {
+    return {
+      exit: 5,
+      reason: "agy not signed in or session expired: run 'agy' in a terminal to sign in",
+    };
+  }
+  if (!validRep && /quota|RESOURCE_EXHAUSTED|rate.?limit|\b429\b/i.test(combined)) {
+    return {
+      exit: 5,
+      reason: `Worker quota exhausted or rate-limited: ${limitText(errHead, 200)}`,
+    };
+  }
+  // The backend's own --print-timeout ends the turn with a partial reply and exit
+  // code 0. Without a report, a run that used up its time limit is a timeout.
+  const limitSec = timeoutMin * 60;
+  if (
+    !validRep &&
+    typeof elapsedSec === 'number' &&
+    elapsedSec >= Math.max(limitSec - 2, limitSec * 0.95)
+  ) {
+    return {
+      exit: 4,
+      reason: `Time limit reached (${timeoutMin} min) before a report was produced; files finished so far are listed under Files`,
+    };
+  }
+  if (!parsed.rawObj) {
+    return {
+      exit: 3,
+      reason: `Backend did not return JSON (exit=${code}): ${limitText(errHead, 200)}`,
+    };
+  }
+  if (!validRep && parsed.denied.length > 0) {
+    return {
+      exit: 3,
+      reason: `Aborted due to denied action (${parsed.denied.join(', ')}); headless mode rejected the unpermitted operation and ended the run (written files were kept). Check if the task tried to write outside writable dirs or needs higher --access`,
+    };
+  }
+  if (parsed.status !== 'SUCCESS' && !validRep) {
+    return {
+      exit: 3,
+      reason: `Backend failed: exit=${code} status=${parsed.status} ${limitText(errHead, 200)}`,
+    };
+  }
+  if (!parsed.rep) {
+    return {
+      exit: 3,
+      reason: 'No structured report returned (raw response saved in report.md)',
+    };
+  }
+  if (parsed.repError) {
+    return {
+      exit: 3,
+      reason: `Invalid report format: ${parsed.repError}`,
+    };
+  }
+  if (validRep.status === 'blocked') {
+    return {
+      exit: 3,
+      reason: `Worker reported blocked: ${limitText(String(validRep.summary), 200)}`,
+    };
+  }
+  if (missing.length > 0) {
+    return {
+      exit: 3,
+      reason: `Reconciliation mismatch: ${missing.length} reported file(s) do not exist (likely wrong path or never written)`,
+    };
+  }
+  if (roTouched.length > 0) {
+    return {
+      exit: 3,
+      reason: `Read-only directory modified: ${roTouched.length} file(s) touched`,
+    };
+  }
+  return { exit: 0, reason: null };
+}
+
+export function formatFileSize(bytes) {
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${bytes} B`;
+}
+
+export function formatReport({
+  name,
+  model,
+  access,
+  secs,
+  reason,
+  parsed,
+  created,
+  modified,
+  deleted,
+  missing,
+  unreported,
+  roTouched,
+  claimed,
+  platform = process.platform,
+  statSync = fs.statSync,
+}) {
+  const rep = parsed.rep && !parsed.repError ? parsed.rep : null;
+  const label = !rep ? 'no-report' : String(rep.status);
+  const totalTokens = parsed.usage?.total_tokens;
+  const tok =
+    typeof totalTokens === 'number' && Number.isFinite(totalTokens) && totalTokens > 0
+      ? totalTokens.toLocaleString('en-US')
+      : '?';
+
+  const formatEntry = (filePath) => {
+    let sizeStr = '';
+    try {
+      const st = statSync(filePath);
+      sizeStr = formatFileSize(Number(st.size));
+    } catch {
+      sizeStr = '';
+    }
+    const what = claimed.get(pathKey(filePath, platform))?.what;
+    return `${filePath}${sizeStr ? `  ${sizeStr}` : ''}${what ? `  -- ${what}` : ''}`;
+  };
+
+  const lines = [];
+  lines.push(`WORKER ${name} | ${label} | ${model} | ${access} | ${secs}s | tokens ${tok}`);
+  if (reason) {
+    lines.push(`REJECTED: ${reason}`);
+  }
+  if (rep) {
+    lines.push(`Summary: ${rep.summary}`);
+  }
+
+  const hasChanges =
+    created.length + modified.length + deleted.length + missing.length + roTouched.length > 0;
+  lines.push(`Files (measured by the dispatcher):${hasChanges ? '' : ' no changes'}`);
+  for (const f of created) lines.push(`  + ${formatEntry(f)}`);
+  for (const f of modified) lines.push(`  ~ ${formatEntry(f)}`);
+  for (const f of deleted) lines.push(`  - deleted: ${f}`);
+  for (const f of missing) lines.push(`  ! reported but missing: ${f}`);
+  for (const f of unreported) lines.push(`  ? changed but not reported: ${f}`);
+  for (const f of roTouched) lines.push(`  !! read-only dir touched: ${f}`);
+
+  const pushSection = (title, items) => {
+    const clean = Array.isArray(items)
+      ? items.map((x) => String(x ?? '').trim()).filter(Boolean)
+      : [];
+    if (clean.length > 0) {
+      lines.push(`${title}:`);
+      clean.forEach((item, idx) => {
+        lines.push(`  ${idx + 1}. ${item}`);
+      });
+    } else {
+      lines.push(`${title}: none`);
+    }
+  };
+
+  if (rep) {
+    pushSection('Findings', rep.findings);
+    pushSection('Verified', rep.verified);
+    pushSection('Unverified', rep.unverified);
+    pushSection('Open', rep.open);
+  } else if (parsed.respText.trim()) {
+    lines.push('Raw response:');
+    lines.push(parsed.respText.trim());
+  }
+
+  return {
+    lines,
+    reportText: `${lines.join('\n')}\n`,
+  };
+}
+
+export function formatShortOutput(lines, reportMdPath) {
+  const truncated = lines.map((line) =>
+    line.length > 400 ? `${line.slice(0, 400)}...` : line
+  );
+  const capped =
+    truncated.length > 60
+      ? [
+          ...truncated.slice(0, 60),
+          `... (${lines.length} lines total; see report.md)`,
+        ]
+      : truncated;
+  capped.push(`Full report: ${reportMdPath}`);
+  return `${capped.join('\n')}\n`;
+}
+
+export function getRepoRoot() {
+  return normalizePath(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..'));
+}

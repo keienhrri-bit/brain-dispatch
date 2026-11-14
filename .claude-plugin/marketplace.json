@@ -1,0 +1,14 @@
+{
+  "name": "brain-dispatch",
+  "description": "Brain Dispatch: one orchestrating model, cheaper models for the legwork.",
+  "owner": {
+    "name": "keienhrri-bit"
+  },
+  "plugins": [
+    {
+      "name": "brain-dispatch",
+      "source": "./",
+      "description": "Main session plans and reviews; a Gemini worker on the Antigravity CLI does the legwork, Sonnet writes long drafts, Haiku looks things up."
+    }
+  ]
+}
