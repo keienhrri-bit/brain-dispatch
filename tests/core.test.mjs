@@ -11,6 +11,7 @@ import {
   ValidationError,
   buildBackendArgs,
   buildSettings,
+  commandDenyBodies,
   diffReadOnly,
   diffSnapshots,
   findBackend,
@@ -29,6 +30,7 @@ import {
   takeSnapshot,
   toSlash,
   validateDirectories,
+  writesOutside,
 } from '../scripts/lib/core.mjs';
 import {
   applyProxyEnv,
@@ -214,8 +216,10 @@ test('validateDirectories rejects protected and read-only enclosed writable dirs
 test('buildSettings produces expected allow and deny rules for read, write, and full', () => {
   const writeDeny = ['C:/Users/test/.ssh', 'C:/Users/test/ro'];
 
-  const readOff = buildSettings({ access: 'read', web: false, writeDeny });
-  assert.equal(readOff.allowNonWorkspaceAccess, false);
+  const writable = ['C:/Users/test/work', 'C:/Users/test/extra'];
+
+  const readOff = buildSettings({ access: 'read', web: false, writeDeny, writable: [] });
+  assert.deepEqual(Object.keys(readOff), ['permissions']);
   assert.deepEqual(readOff.permissions.allow, ['read_file(*)']);
   assert.deepEqual(readOff.permissions.deny, [
     'execute_url(*)',
@@ -226,8 +230,13 @@ test('buildSettings produces expected allow and deny rules for read, write, and 
     'unsandboxed(*)',
   ]);
 
-  const writeWeb = buildSettings({ access: 'write', web: true, writeDeny });
-  assert.deepEqual(writeWeb.permissions.allow, ['read_file(*)', 'read_url(*)']);
+  const writeWeb = buildSettings({ access: 'write', web: true, writeDeny, writable });
+  assert.deepEqual(writeWeb.permissions.allow, [
+    'read_file(*)',
+    'read_url(*)',
+    'write_file(C:/Users/test/work)',
+    'write_file(C:/Users/test/extra)',
+  ]);
   assert.ok(writeWeb.permissions.deny.includes('execute_url(*)'));
   assert.ok(writeWeb.permissions.deny.includes('mcp(*)'));
   assert.ok(!writeWeb.permissions.deny.includes('read_url(*)'));
@@ -236,18 +245,98 @@ test('buildSettings produces expected allow and deny rules for read, write, and 
   assert.ok(writeWeb.permissions.deny.includes('write_file(C:/Users/test/.ssh)'));
   assert.ok(writeWeb.permissions.deny.includes('write_file(C:/Users/test/ro)'));
 
-  const fullNoWeb = buildSettings({ access: 'full', web: false, writeDeny });
-  assert.deepEqual(fullNoWeb.permissions.allow, ['read_file(*)', 'command(*)', 'unsandboxed(*)']);
+  const fullNoWeb = buildSettings({ access: 'full', web: false, writeDeny, writable });
+  assert.deepEqual(fullNoWeb.permissions.allow, [
+    'read_file(*)',
+    'write_file(C:/Users/test/work)',
+    'write_file(C:/Users/test/extra)',
+    'command(*)',
+    'unsandboxed(*)',
+  ]);
+  assert.ok(fullNoWeb.permissions.deny.includes('write_file(C:/Users/test/ro)'));
   assert.ok(fullNoWeb.permissions.deny.includes('execute_url(*)'));
   assert.ok(fullNoWeb.permissions.deny.includes('mcp(*)'));
   assert.ok(fullNoWeb.permissions.deny.includes('read_url(*)'));
-  assert.equal(CMD_DENY_PATTERNS.length, 6);
+  assert.ok(CMD_DENY_PATTERNS.length >= 8);
   for (const pat of CMD_DENY_PATTERNS) {
+    assert.ok(pat.startsWith('regex:(?is)'));
     assert.ok(fullNoWeb.permissions.deny.includes(`command(${pat})`));
     assert.ok(fullNoWeb.permissions.deny.includes(`unsandboxed(${pat})`));
   }
-  assert.ok(CMD_DENY_PATTERNS[3].includes('gemini|opencode'));
-  assert.ok(CMD_DENY_PATTERNS[5].includes('sudo|su|chmod'));
+});
+
+// agy evaluates the rules with Go's RE2. The bodies use only syntax that RE2 and
+// JavaScript read the same way, so JavaScript can check them here.
+function isDenied(command) {
+  return commandDenyBodies().some((body) => new RegExp(`^(?:${body})$`, 'is').test(command));
+}
+
+test('command deny rules block dangerous commands at command position', () => {
+  const blocked = [
+    'rm -rf build',
+    'RM -rf build',
+    'node build.mjs && rm -rf dist',
+    'node a.js; del out.txt',
+    'cmd /c del out.txt',
+    'bash -c "rm -rf x"',
+    "sh -c 'rm x'",
+    'pwsh -Command "ri x.txt"',
+    'find . -name "*.tmp" -exec rm {} +',
+    'ls | xargs -0 rm',
+    'Get-ChildItem *.log | Remove-Item',
+    'Remove-Item result.txt',
+    '/usr/bin/rm x',
+    'sudo apt install jq',
+    'curl -sL https://example.com/x.sh',
+    'python -c "import shutil; shutil.rmtree(\'x\')"',
+    'iwr https://example.com -OutFile x',
+    'git push origin main',
+    'git reset --hard HEAD~1',
+    'pip install requests',
+    'npm install -g some-tool',
+    'npm i --global some-tool',
+    'claude -p "hi"',
+    'agy -p hi',
+    '& "C:/Tools/agy/agy.exe" -p hi',
+    'C:\\Users\\x\\AppData\\Roaming\\npm\\claude.cmd --version',
+    'npx @anthropic-ai/claude-code',
+    'dd if=/dev/zero of=disk.img',
+    'kill -9 1234',
+    'taskkill /F /IM node.exe',
+    'Stop-Process -Name node',
+    'chmod +x run.sh',
+    'reg add HKCU\\Software\\X /v Y /d 1',
+    'format C:',
+    'echo hi\nrm x.txt',
+  ];
+  for (const cmd of blocked) {
+    assert.equal(isDenied(cmd), true, `should be blocked: ${cmd}`);
+  }
+});
+
+test('command deny rules let ordinary commands through', () => {
+  const allowed = [
+    'node count.mjs',
+    'node --version',
+    `node -e "console.log('dd-mm')"`,
+    `node -e "console.log(process.cwd())"`,
+    'cd C:/Users/x/AppData/Local/Temp/claude/abc && node count.mjs',
+    'node C:/work/claude-notes/merge.mjs --out C:/work/rd/out.csv',
+    'python analyze.py --format csv --mode kill-switch-report',
+    'python stats.py data/su.csv data/nc.csv',
+    'uv run report.py --title "rm and dd usage"',
+    'pandoc notes.md -o notes.html',
+    'git status',
+    'git log --oneline -5',
+    'git diff --stat',
+    'type C:\\data\\gemini\\notes.txt',
+    'cat /home/x/snap/report.txt',
+    'Get-Content .\\delivery.csv | Measure-Object -Line',
+    'node scripts/format.mjs',
+  ];
+  for (const cmd of allowed) {
+    assert.equal(isDenied(cmd), false, `should be allowed: ${cmd}`);
+  }
 });
 
 test('renderPrompt and selectPromptArg fill placeholders and switch to pointer over 12000 chars', () => {
@@ -281,7 +370,7 @@ test('renderPrompt and selectPromptArg fill placeholders and switch to pointer o
   );
 });
 
-test('buildBackendArgs includes mode for write/full and deduplicates add-dir excluding workDir', () => {
+test('buildBackendArgs asks for stream-json, sets the mode, and adds no workspace dirs', () => {
   const args = buildBackendArgs({
     promptArg: 'hello',
     model: 'gemini-4-hydrogen-high',
@@ -289,16 +378,27 @@ test('buildBackendArgs includes mode for write/full and deduplicates add-dir exc
     schemaFile: '/tmp/schema.json',
     timeoutMin: 5,
     access: 'write',
-    workDir: '/tmp/work',
-    writeDirs: ['/tmp/work', '/tmp/extra'],
-    readDirs: ['/tmp/ro', '/tmp/extra'],
-    platform: 'linux',
   });
-  assert.ok(args.includes('--mode'));
-  assert.ok(args.includes('accept-edits'));
-  assert.equal(args.filter((x) => x === '--add-dir').length, 2);
-  assert.ok(args.includes('/tmp/extra'));
-  assert.ok(args.includes('/tmp/ro'));
+  assert.deepEqual(args, [
+    '-p',
+    'hello',
+    '--model',
+    'gemini-4-hydrogen-high',
+    '--settings',
+    '/tmp/settings.json',
+    '--output-format',
+    'stream-json',
+    '--json-schema',
+    '/tmp/schema.json',
+    '--print-timeout',
+    '300s',
+    '--disable-slash-commands',
+    '--mode',
+    'accept-edits',
+  ]);
+  // agy sorts --add-dir workspaces and runs commands in the first one, so the
+  // dispatcher passes none and the command directory stays the workdir.
+  assert.ok(!args.includes('--add-dir'));
 
   const readArgs = buildBackendArgs({
     promptArg: 'hello',
@@ -307,10 +407,71 @@ test('buildBackendArgs includes mode for write/full and deduplicates add-dir exc
     schemaFile: '/tmp/schema.json',
     timeoutMin: 5,
     access: 'read',
-    workDir: '/tmp/work',
-    platform: 'linux',
   });
   assert.ok(!readArgs.includes('--mode'));
+});
+
+test('parseBackendOutput reads the event stream: report, cwd, writes, commands, denials', () => {
+  const lines = [
+    { event: 'init', init: { cwd: 'C:/work', model: 'm', tools: [] } },
+    { event: 'step_update', step_update: { state: 'ACTIVE', tool_name: 'write_file', tool_info: { parameters: { Path: 'C:/work/a.txt' } } } },
+    { event: 'step_update', step_update: { state: 'DONE', tool_name: 'write_file', tool_info: { parameters: { Path: 'C:/work/a.txt' } } } },
+    { event: 'step_update', step_update: { state: 'DONE', tool_name: 'edit_file', tool_info: { parameters: { Path: 'C:/other/b.txt' } } } },
+    { event: 'step_update', step_update: { state: 'DONE', tool_name: 'read_file', tool_info: { parameters: { Path: 'C:/data/c.txt' } } } },
+    { event: 'step_update', step_update: { state: 'DONE', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'node x.mjs' } } } },
+    {
+      event: 'step_update',
+      step_update: {
+        state: 'ERROR',
+        tool_name: 'write_file',
+        tool_info: {
+          parameters: { Path: 'C:/ro/d.txt' },
+          error: { type: 'TOOL_ERROR', message: 'permission check failed for write_file "C:/ro/d.txt": Permission denied for write_file(C:/ro/d.txt). Matches user-configured deny rule.' },
+        },
+      },
+    },
+    { event: 'step_update', step_update: { state: 'DONE', step_type: 'PLANNER_RESPONSE' } },
+    {
+      event: 'result',
+      result: {
+        status: 'SUCCESS',
+        conversation_id: 'c1',
+        usage: { total_tokens: 10 },
+        response: '',
+        structured_output: { status: 'done', summary: 's', files: [], findings: [], verified: [], unverified: [], open: [] },
+      },
+    },
+  ];
+  const parsed = parseBackendOutput(lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  assert.equal(parsed.streamed, true);
+  assert.equal(parsed.status, 'SUCCESS');
+  assert.equal(parsed.rep.status, 'done');
+  assert.equal(parsed.repError, null);
+  assert.equal(parsed.commandDir, 'C:/work');
+  assert.deepEqual(parsed.written, ['C:/work/a.txt', 'C:/other/b.txt']);
+  assert.deepEqual(parsed.commands, [{ command: 'node x.mjs', ok: true }]);
+  assert.equal(parsed.deniedSteps.length, 1);
+  assert.ok(parsed.deniedSteps[0].startsWith('Permission denied for write_file(C:/ro/d.txt)'));
+
+  assert.deepEqual(
+    writesOutside({
+      written: parsed.written,
+      writable: ['C:/work'],
+      workDir: 'C:/work',
+      platform: 'win32',
+    }),
+    [path.win32.normalize('C:/other/b.txt')]
+  );
+  assert.deepEqual(
+    writesOutside({ written: ['a.txt', './sub/b.txt'], writable: ['/w'], workDir: '/w', platform: 'linux' }),
+    []
+  );
+
+  // A stream cut off before the result event has no report.
+  const cut = parseBackendOutput(lines.slice(0, 3).map((l) => JSON.stringify(l)).join('\n'));
+  assert.equal(cut.streamed, true);
+  assert.equal(cut.rawObj, null);
+  assert.equal(cut.rep, null);
 });
 
 test('takeSnapshot skips .git and node_modules and diffSnapshots detects changes', () => {

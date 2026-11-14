@@ -20,14 +20,52 @@ export const VALID_EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh']);
 export const PROMPT_INLINE_LIMIT = 12000;
 export const DEFAULT_KILL_GRACE_SEC = 60;
 
-export const CMD_DENY_PATTERNS = Object.freeze([
-  'regex:(?i).*\\b(Remove-Item|rm|del|erase|rmdir|rd|ri|Clear-Content|Clear-RecycleBin)\\b.*',
-  'regex:(?i).*\\b(curl|wget|Invoke-WebRequest|iwr|Invoke-RestMethod|irm|Start-BitsTransfer|ssh|scp|ftp)\\b.*',
-  'regex:(?i).*\\bgit\\s+(push|reset|clean|restore)\\b.*',
-  'regex:(?i).*\\b(shutdown|Restart-Computer|Stop-Computer|schtasks|Register-ScheduledTask|Set-ExecutionPolicy|diskpart|Stop-Process|taskkill|Start-Process|winget|choco|agy|codex|claude|grok|gemini|opencode)\\b.*',
-  'regex:(?i).*\\b(reg\\s+(add|delete|import)|format\\s+[a-z]:|pip\\s+install|npm\\s+(i|install)\\s+(-g|--global))\\b.*',
-  'regex:(?i).*\\b(sudo|su|chmod|chown|chgrp|dd|mkfs|mount|umount|kill|pkill|killall|nc|ncat|telnet|rsync|sftp|unlink|shred|brew|apt|apt-get|yum|dnf|pacman|snap|launchctl|systemctl|crontab|osascript)\\b.*',
+// Command deny rules for `full` access. agy matches each `regex:` rule against the
+// whole command string (Go RE2 syntax: no lookarounds). Patterns are anchored at
+// both ends so they behave the same under full-match and search semantics, and
+// `(?is)` lets `.` cross newlines in multi-line commands.
+//
+// Names that are distinctive enough are blocked wherever they appear as a word.
+// Short or common names (rm, dd, kill, claude, ...) only count at command
+// position: the start of the command, or right after a shell separator, a
+// nested-shell flag (`-c`, `/c`, `-Command`), `-exec` or `xargs`, optionally
+// behind a path prefix (`/usr/bin/rm`). A word inside an argument, a string or
+// a path (`'dd-mm'`, `C:/tmp/claude/x`) does not trigger them.
+const CMD_POSITION_PREFIX = String.raw`(^|.*?([;&|(){}\x60\r\n]|\s-c\s|\s/c\s|\s-Command\s|\s-exec\s|\bxargs(\s+-\S+)*\s))\s*["']?((sudo|doas|env|nohup|exec|time|command)\s+)*([^\s"';&|]*[\\/])?`;
+const CMD_POSITION_SUFFIX = String.raw`(\.exe|\.cmd|\.bat|\.ps1|\.sh)?["']?(\s.*)?$`;
+
+export const CMD_DENY_ANYWHERE = Object.freeze({
+  delete: String.raw`Remove-Item|Clear-Content|Clear-RecycleBin|shred|rmtree|rimraf`,
+  network: String.raw`curl|wget|Invoke-WebRequest|Invoke-RestMethod|Start-BitsTransfer|Net\.WebClient`,
+  system: String.raw`shutdown|Restart-Computer|Stop-Computer|schtasks|Register-ScheduledTask|Set-ExecutionPolicy|diskpart|Stop-Process|taskkill|Start-Process|winget|choco|launchctl|systemctl|crontab|osascript|mkfs|pkill|killall`,
+});
+
+export const CMD_DENY_AT_COMMAND = Object.freeze({
+  delete: String.raw`rm|del|erase|rd|ri|rmdir|unlink`,
+  network: String.raw`iwr|irm|ssh|scp|sftp|ftp|telnet|nc|ncat|rsync`,
+  system: String.raw`sudo|doas|su|chmod|chown|chgrp|dd|mount|umount|kill|reg|format|brew|apt|apt-get|yum|dnf|pacman|snap`,
+  agents: String.raw`agy|codex|claude|grok|gemini|opencode|aider|cursor-agent`,
+});
+
+export const CMD_DENY_EXTRA = Object.freeze([
+  String.raw`.*(@anthropic-ai/claude-code|@google/gemini-cli|@openai/codex).*`,
+  String.raw`.*\bgit\s+(push|reset|clean|restore)\b.*`,
+  String.raw`.*\b(pip3?\s+install|npm\s+(i|install|add)\s+(.*\s)?(-g|--global)|yarn\s+global\s+add|pnpm\s+(add|install)\s+(.*\s)?(-g|--global))\b.*`,
 ]);
+
+export function commandDenyBodies() {
+  return [
+    ...Object.values(CMD_DENY_ANYWHERE).map((names) => String.raw`.*\b(${names})\b.*`),
+    ...Object.values(CMD_DENY_AT_COMMAND).map(
+      (names) => `${CMD_POSITION_PREFIX}(${names})${CMD_POSITION_SUFFIX}`
+    ),
+    ...CMD_DENY_EXTRA,
+  ];
+}
+
+export const CMD_DENY_PATTERNS = Object.freeze(
+  commandDenyBodies().map((body) => `regex:(?is)${body}`)
+);
 
 export class ValidationError extends Error {
   constructor(message) {
@@ -426,7 +464,13 @@ export function validateDirectories({
   };
 }
 
-export function buildSettings({ access, web, writeDeny = [] }) {
+// agy evaluates rules strictly as Deny > Ask > Allow, and file access outside
+// the workspace defaults to Ask (which print mode has been observed to let
+// through). It cannot express "only these directories are writable": a broad
+// deny would also beat the narrow allow. So writable directories get explicit
+// allows, protected directories get denies, and everything the worker writes
+// with its file tools is audited afterwards from the event stream.
+export function buildSettings({ access, web, writeDeny = [], writable = [] }) {
   const allow = ['read_file(*)'];
   const deny = ['execute_url(*)'];
 
@@ -442,12 +486,18 @@ export function buildSettings({ access, web, writeDeny = [] }) {
       deny.push('write_file(*)', 'command(*)', 'unsandboxed(*)');
       break;
     case 'write':
+      for (const dir of writable) {
+        allow.push(`write_file(${toSlash(dir)})`);
+      }
       deny.push('command(*)', 'unsandboxed(*)');
       for (const dir of writeDeny) {
         deny.push(`write_file(${toSlash(dir)})`);
       }
       break;
     case 'full':
+      for (const dir of writable) {
+        allow.push(`write_file(${toSlash(dir)})`);
+      }
       allow.push('command(*)', 'unsandboxed(*)');
       for (const pattern of CMD_DENY_PATTERNS) {
         deny.push(`command(${pattern})`, `unsandboxed(${pattern})`);
@@ -461,7 +511,6 @@ export function buildSettings({ access, web, writeDeny = [] }) {
   }
 
   return {
-    allowNonWorkspaceAccess: false,
     permissions: {
       allow,
       deny,
@@ -516,12 +565,10 @@ export function buildBackendArgs({
   schemaFile,
   timeoutMin,
   access,
-  workDir,
-  writeDirs = [],
-  readDirs = [],
-  platform = process.platform,
 }) {
   const timeoutSec = Math.max(1, Math.round(timeoutMin * 60));
+  // stream-json carries one event per tool call (with its parameters) before the
+  // final result, which is what lets the dispatcher audit writes and commands.
   const argv = [
     '-p',
     promptArg,
@@ -530,7 +577,7 @@ export function buildBackendArgs({
     '--settings',
     settingsFile,
     '--output-format',
-    'json',
+    'stream-json',
     '--json-schema',
     schemaFile,
     '--print-timeout',
@@ -542,12 +589,11 @@ export function buildBackendArgs({
     argv.push('--mode', 'accept-edits');
   }
 
-  for (const dir of uniquePaths([...writeDirs, ...readDirs], platform)) {
-    if (!isSamePath(dir, workDir, platform)) {
-      argv.push('--add-dir', dir);
-    }
-  }
-
+  // No --add-dir. agy sorts its workspace directories alphabetically and runs
+  // commands in the first one, so any added directory could become the command
+  // directory and catch files a script writes with relative paths. Reading
+  // outside the workspace works through the read_file(*) rule, and the extra
+  // writable directories have their own write_file allows.
   return argv;
 }
 
@@ -852,28 +898,107 @@ export function validateReportSchema(rep) {
   return null;
 }
 
+function parseJsonObject(line) {
+  try {
+    const parsed = JSON.parse(line);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// Reads agy's stream-json output: an `init` event, one `step_update` event per
+// step (tool calls carry `tool_name` and `tool_info.parameters`), and a final
+// `result` event shaped like the plain json output. Returns null when the text
+// is not an event stream.
+export function parseEventStream(text) {
+  const events = String(text ?? '')
+    .split(/\r?\n/)
+    .filter((line) => line.trimStart().startsWith('{'))
+    .map(parseJsonObject)
+    .filter((obj) => obj && typeof obj.event === 'string');
+  if (events.length === 0) return null;
+
+  let init = null;
+  let result = null;
+  const tools = [];
+  for (const ev of events) {
+    const body = ev[ev.event];
+    if (!body || typeof body !== 'object') continue;
+    if (ev.event === 'init') {
+      init = body;
+    } else if (ev.event === 'result') {
+      result = body;
+    } else if (
+      ev.event === 'step_update' &&
+      body.tool_name &&
+      (body.state === 'DONE' || body.state === 'ERROR')
+    ) {
+      const info = body.tool_info && typeof body.tool_info === 'object' ? body.tool_info : {};
+      tools.push({
+        tool: String(body.tool_name),
+        state: String(body.state),
+        params: info.parameters && typeof info.parameters === 'object' ? info.parameters : {},
+        error: info.error && typeof info.error.message === 'string' ? info.error.message : null,
+      });
+    }
+  }
+  return { init, result, tools };
+}
+
+const WRITE_TOOL = /write|edit|replace|create|delete|remove|move|rename|patch|insert|append|copy|mkdir|save/i;
+const READ_ONLY_TOOL = /^(read|view|list|search|find|grep|glob|fetch|get|stat)/i;
+const PATH_PARAM = /path|file|target|dest|dir/i;
+const NOT_PATH_PARAM = /content|text|body|data|instruction|description|code/i;
+
+// File paths a tool call wrote to (agy's write_file and edit_file take `Path`).
+// Commands are not included: what a command writes cannot be seen from its
+// parameters.
+export function writtenPaths(tools) {
+  const out = [];
+  for (const call of tools) {
+    if (call.state !== 'DONE' || call.tool === 'run_command') continue;
+    if (!WRITE_TOOL.test(call.tool) || READ_ONLY_TOOL.test(call.tool)) continue;
+    for (const [key, value] of Object.entries(call.params)) {
+      if (!PATH_PARAM.test(key) || NOT_PATH_PARAM.test(key)) continue;
+      if (typeof value !== 'string') continue;
+      const v = value.trim();
+      if (v && v.length < 1024 && !/[\r\n]/.test(v)) out.push(v);
+    }
+  }
+  return out;
+}
+
+export function commandsRun(tools) {
+  return tools
+    .filter((call) => call.tool === 'run_command')
+    .map((call) => ({
+      command: String(call.params.CommandLine ?? call.params.command ?? call.params.Command ?? ''),
+      ok: call.state === 'DONE',
+    }));
+}
+
+export function deniedSteps(tools) {
+  return tools
+    .filter((call) => call.state === 'ERROR' && call.error && /permission/i.test(call.error))
+    .map((call) => limitText(call.error.replace(/^.*?(Permission denied for )/i, '$1'), 240));
+}
+
 export function parseBackendOutput(stdout) {
   let rawObj = null;
   const text = String(stdout ?? '');
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      rawObj = parsed;
-    }
-  } catch {
-    const lines = text.split(/\r?\n/).filter((line) => line.trimStart().startsWith('{'));
-    const last = lines[lines.length - 1];
-    if (last) {
-      try {
-        const parsed = JSON.parse(last);
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          rawObj = parsed;
-        }
-      } catch {
-        // Ignore unparseable line
-      }
+  const stream = parseEventStream(text);
+  if (stream) {
+    rawObj = stream.result;
+  } else {
+    rawObj = parseJsonObject(text);
+    if (!rawObj) {
+      const lines = text.split(/\r?\n/).filter((line) => line.trimStart().startsWith('{'));
+      const last = lines[lines.length - 1];
+      if (last) rawObj = parseJsonObject(last);
     }
   }
+  const tools = stream ? stream.tools : [];
 
   const status = rawObj ? (rawObj.status != null ? String(rawObj.status) : '') : 'UNPARSED';
   const usage = rawObj?.usage ?? null;
@@ -916,7 +1041,27 @@ export function parseBackendOutput(stdout) {
     respText,
     rep,
     repError,
+    streamed: Boolean(stream),
+    commandDir: stream?.init?.cwd ?? null,
+    tools,
+    written: writtenPaths(tools),
+    commands: commandsRun(tools),
+    deniedSteps: deniedSteps(tools),
   };
+}
+
+// Paths the worker wrote with its file tools that are outside every writable
+// directory. agy does not block these; the dispatcher reports them.
+export function writesOutside({ written, writable, workDir, platform = process.platform }) {
+  const outside = new Map();
+  for (const raw of written) {
+    const resolved = resolveClaimedPath(raw, workDir, platform);
+    if (!resolved) continue;
+    if (!writable.some((dir) => isInside(resolved, dir, platform))) {
+      outside.set(pathKey(resolved, platform), resolved);
+    }
+  }
+  return [...outside.values()].sort();
 }
 
 export function judgeRun({
@@ -928,6 +1073,7 @@ export function judgeRun({
   parsed,
   missing = [],
   roTouched = [],
+  outside = [],
   elapsedSec = null,
 }) {
   const errLines = String(stderr ?? '')
@@ -1014,6 +1160,12 @@ export function judgeRun({
       reason: `Read-only directory modified: ${roTouched.length} file(s) touched`,
     };
   }
+  if (outside.length > 0) {
+    return {
+      exit: 3,
+      reason: `Wrote ${outside.length} file(s) outside the writable directories (see !! lines)`,
+    };
+  }
   return { exit: 0, reason: null };
 }
 
@@ -1037,6 +1189,7 @@ export function formatReport({
   missing,
   unreported,
   roTouched,
+  outside = [],
   claimed,
   platform = process.platform,
   statSync = fs.statSync,
@@ -1071,7 +1224,13 @@ export function formatReport({
   }
 
   const hasChanges =
-    created.length + modified.length + deleted.length + missing.length + roTouched.length > 0;
+    created.length +
+      modified.length +
+      deleted.length +
+      missing.length +
+      roTouched.length +
+      outside.length >
+    0;
   lines.push(`Files (measured by the dispatcher):${hasChanges ? '' : ' no changes'}`);
   for (const f of created) lines.push(`  + ${formatEntry(f)}`);
   for (const f of modified) lines.push(`  ~ ${formatEntry(f)}`);
@@ -1079,6 +1238,22 @@ export function formatReport({
   for (const f of missing) lines.push(`  ! reported but missing: ${f}`);
   for (const f of unreported) lines.push(`  ? changed but not reported: ${f}`);
   for (const f of roTouched) lines.push(`  !! read-only dir touched: ${f}`);
+  for (const f of outside) lines.push(`  !! written outside writable dirs: ${f}`);
+
+  const denied = Array.isArray(parsed.deniedSteps) ? parsed.deniedSteps : [];
+  if (denied.length > 0) {
+    lines.push('Denied by the permission rules:');
+    for (const d of denied.slice(0, 10)) lines.push(`  x ${d}`);
+    if (denied.length > 10) lines.push(`  ... ${denied.length - 10} more`);
+  }
+  const commands = Array.isArray(parsed.commands) ? parsed.commands : [];
+  if (access === 'full' && commands.length > 0) {
+    lines.push('Commands run (not audited for file writes):');
+    for (const c of commands.slice(0, 15)) {
+      lines.push(`  ${c.ok ? '$' : 'x'} ${limitText(String(c.command ?? ''), 200)}`);
+    }
+    if (commands.length > 15) lines.push(`  ... ${commands.length - 15} more`);
+  }
 
   const pushSection = (title, items) => {
     const clean = Array.isArray(items)

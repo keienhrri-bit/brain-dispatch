@@ -31,6 +31,7 @@ import {
   takeSnapshot,
   uniquePaths,
   validateDirectories,
+  writesOutside,
 } from './lib/core.mjs';
 import { applyProxyEnv, resolveBackendProxy } from './lib/proxy.mjs';
 
@@ -203,6 +204,7 @@ async function main() {
     access: opts.access,
     web: opts.web,
     writeDeny: dirs.writeDeny,
+    writable: dirs.writable,
   });
 
   const stamp = formatJobStamp();
@@ -235,10 +237,6 @@ async function main() {
     schemaFile,
     timeoutMin: opts.timeoutMin,
     access: opts.access,
-    workDir: dirs.workDir,
-    writeDirs: dirs.writeDirs,
-    readDirs: dirs.readDirs,
-    platform,
   });
 
   if (opts.dryRun) {
@@ -295,7 +293,7 @@ async function main() {
 
   const elapsedSec = (Date.now() - startMs) / 1000;
   const secs = Math.floor(elapsedSec);
-  fs.writeFileSync(path.join(jobDir, 'raw.json'), runResult.stdout, 'utf8');
+  fs.writeFileSync(path.join(jobDir, 'events.jsonl'), runResult.stdout, 'utf8');
   fs.writeFileSync(path.join(jobDir, 'err.log'), runResult.stderr, 'utf8');
 
   const afterRW = takeSnapshot(watchRW, platform);
@@ -312,6 +310,12 @@ async function main() {
     workDir: dirs.workDir,
     platform,
   });
+  const outside = writesOutside({
+    written: parsed.written,
+    writable: dirs.writable,
+    workDir: dirs.workDir,
+    platform,
+  });
 
   const { exit, reason } = judgeRun({
     timedOut: runResult.timedOut,
@@ -322,6 +326,7 @@ async function main() {
     parsed,
     missing,
     roTouched,
+    outside,
     elapsedSec,
   });
 
@@ -338,6 +343,7 @@ async function main() {
     missing,
     unreported,
     roTouched,
+    outside,
     claimed,
     platform,
   });
@@ -376,6 +382,11 @@ async function main() {
     missing,
     unreported,
     readonly_touched: roTouched,
+    written_outside: outside,
+    written_by_tools: parsed.written,
+    denied_steps: parsed.deniedSteps,
+    commands: parsed.commands,
+    command_dir: parsed.commandDir,
     conversation_id: parsed.conversationId,
     usage: parsed.usage,
   };

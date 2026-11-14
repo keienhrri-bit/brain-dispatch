@@ -41,29 +41,75 @@ if (args[0] === 'models') {
   process.exit(0);
 }
 
-function emitOk() {
-  if (process.env.FAKE_BACKEND_TOUCH_FILE) {
-    fs.writeFileSync(process.env.FAKE_BACKEND_TOUCH_FILE, 'touched by backend\n', 'utf8');
+// Like agy, answer with an event stream when asked for stream-json, and with a
+// single JSON object otherwise.
+const formatIdx = args.indexOf('--output-format');
+const streamMode = formatIdx >= 0 && args[formatIdx + 1] === 'stream-json';
+const steps = [];
+
+function toSlash(p) {
+  return p.split(path.sep).join('/');
+}
+
+// Writes a file for real and records the matching write_file step.
+function writeWithTool(filePath, text) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, text, 'utf8');
+  steps.push({ tool: 'write_file', state: 'DONE', parameters: { Path: toSlash(filePath) } });
+}
+
+function emit(result, code = 0) {
+  if (streamMode) {
+    const lines = [
+      { event: 'init', init: { cwd: toSlash(process.cwd()), model: 'fake', tools: [] } },
+      ...steps.map((s) => ({
+        event: 'step_update',
+        step_update: {
+          state: s.state,
+          step_type: 'TOOL',
+          tool_name: s.tool,
+          tool_info: {
+            name: s.tool,
+            parameters: s.parameters,
+            ...(s.error ? { error: { type: 'TOOL_ERROR', message: s.error } } : {}),
+          },
+        },
+      })),
+      { event: 'result', result },
+    ];
+    process.stdout.write(lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  } else {
+    process.stdout.write(`${JSON.stringify(result)}\n`);
   }
-  const outFile = path.join(process.cwd(), 'output.txt');
-  fs.writeFileSync(outFile, 'fake backend output\n', 'utf8');
-  const payload = {
+  process.exit(code);
+}
+
+function okResult(files, summary = 'Completed fake job and wrote output.txt.') {
+  return {
     status: 'SUCCESS',
     conversation_id: 'fake-conv-ok',
     usage: { total_tokens: 1234 },
     response: '',
     structured_output: {
       status: 'done',
-      summary: 'Completed fake job and wrote output.txt.',
-      files: [{ path: outFile, what: 'Created fake output file' }],
+      summary,
+      files,
       findings: ['Wrote output.txt (fake-backend.mjs:emitOk)'],
       verified: ['Verified output.txt was written'],
       unverified: [],
       open: [],
     },
   };
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
-  process.exit(0);
+}
+
+function emitOk() {
+  if (process.env.FAKE_BACKEND_TOUCH_FILE) {
+    // A write the tool events do not show, like one made by a script.
+    fs.writeFileSync(process.env.FAKE_BACKEND_TOUCH_FILE, 'touched by backend\n', 'utf8');
+  }
+  const outFile = path.join(process.cwd(), 'output.txt');
+  writeWithTool(outFile, 'fake backend output\n');
+  emit(okResult([{ path: outFile, what: 'Created fake output file' }]));
 }
 
 const mode = process.env.FAKE_BACKEND_MODE || 'ok';
@@ -73,9 +119,33 @@ switch (mode) {
     emitOk();
     break;
 
+  case 'outside': {
+    const outFile = path.join(process.cwd(), 'output.txt');
+    writeWithTool(outFile, 'fake backend output\n');
+    const stray = path.join(process.env.FAKE_BACKEND_OUTSIDE_DIR, 'stray.txt');
+    writeWithTool(stray, 'written outside the writable directories\n');
+    emit(okResult([{ path: outFile, what: 'Created fake output file' }]));
+    break;
+  }
+
+  case 'commands': {
+    const outFile = path.join(process.cwd(), 'output.txt');
+    writeWithTool(outFile, 'fake backend output\n');
+    steps.push({ tool: 'run_command', state: 'DONE', parameters: { CommandLine: 'node build.mjs' } });
+    steps.push({
+      tool: 'run_command',
+      state: 'ERROR',
+      parameters: { CommandLine: 'Remove-Item old.txt' },
+      error:
+        'permission check failed for unsandboxed "Remove-Item old.txt": Permission denied for unsandboxed(Remove-Item old.txt). Matches user-configured deny rule.',
+    });
+    emit(okResult([{ path: outFile, what: 'Created fake output file' }]));
+    break;
+  }
+
   case 'missing': {
     const missingFile = path.join(process.cwd(), 'ghost.txt');
-    const payload = {
+    emit({
       status: 'SUCCESS',
       conversation_id: 'fake-conv-missing',
       usage: { total_tokens: 200 },
@@ -89,35 +159,30 @@ switch (mode) {
         unverified: [],
         open: [],
       },
-    };
-    process.stdout.write(`${JSON.stringify(payload)}\n`);
-    process.exit(0);
+    });
     break;
   }
 
-  case 'noreport': {
-    const payload = {
+  case 'noreport':
+    emit({
       status: 'SUCCESS',
       conversation_id: 'fake-conv-noreport',
       usage: { total_tokens: 300 },
       response: 'Here is a plain text response with no structured report.',
-    };
-    process.stdout.write(`${JSON.stringify(payload)}\n`);
-    process.exit(0);
+    });
     break;
-  }
 
-  case 'denied': {
-    const payload = {
-      status: 'DENIED',
-      conversation_id: 'fake-conv-denied',
-      denied_actions: [{ action: 'write_file(/protected/secret.txt)' }],
-      response: '',
-    };
-    process.stdout.write(`${JSON.stringify(payload)}\n`);
-    process.exit(1);
+  case 'denied':
+    emit(
+      {
+        status: 'DENIED',
+        conversation_id: 'fake-conv-denied',
+        denied_actions: [{ action: 'write_file(/protected/secret.txt)' }],
+        response: '',
+      },
+      1
+    );
     break;
-  }
 
   case 'auth':
     process.stderr.write('Error: authentication required. Run agy to sign in.\n');

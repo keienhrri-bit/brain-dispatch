@@ -27,12 +27,12 @@ flowchart LR
 1. The brain writes a self-contained brief (goal, background, input, output, done-when, boundaries).
 2. `worker.mjs` prepends a fixed protocol, generates a one-off permission profile for this single run, snapshots the writable directories and starts `agy` headless.
 3. The worker does the job inside the directories it was given and answers with one JSON report that must match a schema.
-4. The dispatcher snapshots the directories again and **measures** what was created, changed or deleted, then reconciles that with what the worker claims.
+4. The dispatcher snapshots the directories again and **measures** what was created, changed or deleted, then reconciles that with what the worker claims and with the writes recorded in the worker's event stream.
 5. The brain gets a short report, spot-checks it and decides what to use.
 
 ## What makes it different
 
-- **Permissions are enforced, not requested.** Each run gets explicit allow and deny rules. Nothing uses `--dangerously-skip-permissions`.
+- **Permissions are enforced, and checked afterwards.** Each run gets explicit allow and deny rules, and every file the worker writes with its tools is checked against the writable directories once it finishes. Nothing uses `--dangerously-skip-permissions`.
 - **File changes are measured.** The report's file list comes from a before/after comparison, so a mistyped path or an unreported edit shows up.
 - **A fixed report format.** Status, summary, files, findings, verified, unverified, open. A reply that does not match the schema is rejected rather than trusted.
 - **Honest failure.** Timeouts, missing login, quota, denied actions and files that do not reconcile each have their own exit code and message.
@@ -73,7 +73,7 @@ After setup you mostly do nothing. A short note at session start tells the main 
 | `--access` | The worker can | Typical job |
 |---|---|---|
 | `read` | Read files. No writes, no commands | Lookups, counting, independent solving |
-| `write` (default) | Create and change files in the working directory and any `--write-dir`. No commands | Extract tables, notes, conversions |
+| `write` (default) | Write to the working directory and any `--write-dir`. Protected and read-only directories are denied; a write anywhere else is caught after the run and the job is rejected. No commands | Extract tables, notes, conversions |
 | `full` | `write`, plus run commands | A script has to actually run |
 
 Never writable at any level: agent and credential directories under your home directory (`.claude`, `.codex`, `.gemini`, `.grok`, `.ssh`, `.aws`, `.gnupg`, `.kube`, `.config/gh`), the dispatcher's own state directory, anything in `protect` in the config, and every `--read-dir`. MCP servers and the browser are always off; `--web` allows web search and URL reads.
@@ -94,7 +94,9 @@ Open: none
 Full report: ~/.brain-dispatch/jobs/20261114-213005_timeouts/report.md
 ```
 
-Exit codes: `0` valid report · `2` bad arguments or directory rule violated · `3` rejected · `4` timeout · `5` backend missing, not signed in, or out of quota.
+File lines: `+` created · `~` modified · `-` deleted · `!` reported but missing · `?` changed but not reported · `!!` a read-only directory was touched, or a file was written outside the writable directories. Two more sections appear when they apply: **Denied by the permission rules** lists the tool calls the rules refused, and at `full` access **Commands run** lists every command the worker ran.
+
+Exit codes: `0` valid report · `2` bad arguments or directory rule violated · `3` rejected (no valid report, blocked, files that do not reconcile, a `!!` line) · `4` timeout, including a run that used up its time limit without a report · `5` backend missing, not signed in, or out of quota.
 
 ## Configuration
 
@@ -133,14 +135,15 @@ node scripts/doctor.mjs                                                         
 
 ## Security notes
 
-- **`full` access has no OS sandbox.** File tools respect the directory rules, but a command can write wherever the process can. The dispatcher only blocks command patterns: deleting, downloading, `git push`/`reset`/`clean`, system settings, global installs and starting other agents. That is a seat belt, not a cage. Use `full` on material you trust, in a working directory you can throw away or review with `git diff`.
+- **Writes outside the writable directories are caught, not prevented.** `agy` evaluates its rules as Deny > Ask > Allow and cannot express "only these directories are writable": a broad deny would also override the narrow allows, and in headless mode a directory no rule mentions is not blocked. So the dispatcher allows the writable directories, denies the protected and read-only ones, and afterwards reads the worker's event stream (`--output-format stream-json`). Any file its tools wrote elsewhere is listed with `!!` and the job is rejected with exit code 3. By then the file is already on disk; the report tells you where.
+- **`full` access has no OS sandbox.** The audit above sees what the file tools write, not what a command writes, and a command can write wherever the process can. The report lists every command that ran, and read-only directories are still compared before and after the run. The dispatcher also blocks command patterns: deleting, downloading, `git push`/`reset`/`clean`/`restore`, system settings, global installs and starting other agents. Short names such as `rm` or `dd` only count where a command starts, so they do not trip on arguments or paths. That is a seat belt, not a cage. Use `full` on material you trust, in a working directory you can throw away or review with `git diff`.
 - Every level can **read** the whole machine. Do not point the worker at material you would not send to the model provider. Briefs and the files the worker reads go to Google.
 - Text inside the material is treated as content, not as instructions, by protocol. A protocol is not a guarantee. Review what comes back.
 - The permission rule syntax belongs to `agy` and has changed between versions. Check with `--dry-run` after upgrading `agy`.
 
 ## Status
 
-Version 0.1.0. Developed on Windows 11 with Node 24 and `agy` 1.5.9. The dispatcher is a Node port of a PowerShell script that has run real jobs, and it ships with 29 automated tests that run against a fake backend. The code is written to be cross-platform, but macOS and Linux have not been exercised yet; reports and fixes are welcome.
+Version 0.2.0. Developed on Windows 11 with Node 24 and `agy` 1.5.9. The dispatcher is a Node port of a PowerShell script that has run real jobs. It ships with automated tests that run against a fake backend, and the permission rules, the command directory and the write audit have been checked against real `agy` runs. The code is written to be cross-platform, but macOS and Linux have not been exercised yet; reports and fixes are welcome.
 
 Not included yet: a reviewer role on another vendor's CLI, a web-research role, and per-job cost accounting.
 

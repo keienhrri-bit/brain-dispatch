@@ -84,13 +84,14 @@ Run it in the background and wait for the completion notice. Do not poll.
 | `--access` | The worker can | Use it for |
 |---|---|---|
 | `read` | Read any file. No writes, no commands | Lookups, extraction, counting, independent solving. The result is in the report |
-| `write` (default) | Create and change files in `--workdir` and `--write-dir`. No commands | Jobs that end in files: extract tables, notes, lists, conversions |
+| `write` (default) | Write to `--workdir` and `--write-dir`. Protected and read-only directories are denied; a write anywhere else is caught after the run and rejects the job. No commands | Jobs that end in files: extract tables, notes, lists, conversions |
 | `full` | `write`, plus run commands | Only when a script must actually run |
 
 - All three levels can read the whole machine. MCP servers and the browser are always off. `--web` allows web search and reading URLs.
 - Some directories are never writable: agent and credential directories under the home directory, the dispatcher's own state directory, anything listed in `protect` in the config or passed with `--protect`, and every `--read-dir`.
 - Give the worker a working directory of its own (a scratch folder or a subfolder), not the user's project root, unless the job is to change that project and the user agreed.
-- **`full` has no OS sandbox.** File tools stay inside the directory limits, but a command can write wherever the process can. The dispatcher only blocks command patterns for deleting, downloading, `git push`/`reset`, system settings, package installs and starting other agents. Use `full` only when needed, and say in **Boundaries** where the script may read and write.
+- Writes outside the writable directories are caught afterwards, not prevented: `agy` cannot limit writes to a list of directories, so the dispatcher audits what the worker's file tools wrote. By the time you see `!!`, the file is on disk.
+- **`full` has no OS sandbox.** The audit sees the file tools, not what a command writes, and a command can write wherever the process can. The report lists every command that ran, and read-only directories are still compared before and after. The dispatcher also blocks command patterns for deleting, downloading, `git push`/`reset`/`clean`/`restore`, system settings, package installs and starting other agents. Commands run in `--workdir`, so a script that writes with relative paths writes there. Use `full` only when needed, and say in **Boundaries** where the script may read and write.
 - Never pass `--dangerously-skip-permissions` to the backend, and never edit the dispatcher to do so.
 
 Effort: `high` (the default) for search, extraction and tidying. `xhigh` for independent solving, recomputation and code that must be right. `low` or `medium` for trivial bulk work.
@@ -104,12 +105,17 @@ WORKER <name> | done/partial/blocked/no-report | <model> | <access> | <secs>s | 
 REJECTED: <reason>                 (only when the exit code is not 0)
 Summary: ...
 Files (measured by the dispatcher):
-  + created   ~ modified   - deleted   ! reported but missing   ? changed but not reported   !! read-only dir touched
+  + created   ~ modified   - deleted   ! reported but missing   ? changed but not reported
+  !! read-only dir touched   !! written outside writable dirs
+Denied by the permission rules:    (only when a tool call was refused)
+  x Permission denied for ...
+Commands run (not audited for file writes):    (full access only)
+  $ succeeded   x failed or denied
 Findings: ...      Verified: ...      Unverified: ...      Open: ...
 ```
 
-- The **Files** block is measured by comparing the directories before and after the run. It is not the worker's claim. If you see `!`, `-` or `!!`, find out what happened before using anything.
-- Exit codes: `0` valid report (done or partial); `2` bad arguments or a directory rule violated; `3` rejected (no structured report, aborted on a denied action, blocked, files do not reconcile); `4` timeout; `5` backend missing, not logged in or out of quota.
+- The **Files** block is measured by comparing the directories before and after the run, plus the writes recorded in the worker's event stream. It is not the worker's claim. If you see `!`, `-` or `!!`, find out what happened before using anything.
+- Exit codes: `0` valid report (done or partial); `2` bad arguments or a directory rule violated; `3` rejected (no structured report, aborted on a denied action, blocked, files do not reconcile, a read-only directory touched, a file written outside the writable directories); `4` timeout, including a run that used up its time limit without a report; `5` backend missing, not logged in or out of quota.
 
 **Your part is not optional:**
 
@@ -121,7 +127,8 @@ Findings: ...      Verified: ...      Unverified: ...      Open: ...
 ## When it fails
 
 - **Timeout or no report:** look at the Files block. The protocol tells the worker to write as it goes, so finished parts are usually on disk. Narrow the job and dispatch the rest, or finish it yourself.
-- **Aborted on a denied action:** the brief asked for something outside the access level, usually a write outside the writable directories. Fix the brief or raise `--access`.
+- **Aborted on a denied action:** the brief asked for something the access level does not allow, such as a command at `write` or a write to a protected or read-only directory. Fix the brief or raise `--access`.
+- **`!! written outside writable dirs`:** the file is already there. Look at it and remove or move it if it should not stay, then fix the brief (use paths relative to the working directory) or add the directory with `--write-dir`.
 - **Exit 5:** ask the user to run `agy` once in a terminal to log in, or wait for quota. Meanwhile use `brain-dispatch:finder` for lookups and do the rest yourself.
 - **The same job failed twice:** stop dispatching it. Do it yourself.
 

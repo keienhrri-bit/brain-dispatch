@@ -120,13 +120,16 @@ test('worker mode ok returns 0, lists + file, and writes job artifacts and ledge
     const jobFolders = fs.readdirSync(jobsRoot);
     assert.equal(jobFolders.length, 1);
     const jobDir = path.join(jobsRoot, jobFolders[0]);
-    for (const f of ['prompt.md', 'settings.json', 'raw.json', 'err.log', 'report.md', 'report.json', 'meta.json']) {
+    for (const f of ['prompt.md', 'settings.json', 'events.jsonl', 'err.log', 'report.md', 'report.json', 'meta.json']) {
       assert.ok(fs.existsSync(path.join(jobDir, f)), `missing ${f}`);
     }
     const meta = JSON.parse(fs.readFileSync(path.join(jobDir, 'meta.json'), 'utf8'));
     assert.equal(meta.exit, 0);
     assert.equal(meta.ok, true);
     assert.equal(meta.created.length, 1);
+    assert.deepEqual(meta.written_outside, []);
+    assert.equal(meta.written_by_tools.length, 1);
+    assert.equal(meta.command_dir, toSlash(workDir));
 
     const ledgerLines = fs.readFileSync(path.join(stateHome, 'ledger.jsonl'), 'utf8').trim().split('\n');
     assert.equal(ledgerLines.length, 1);
@@ -331,6 +334,57 @@ test('worker full access detects modified read-only dir as exit 3', async () => 
     assert.equal(res.code, 3);
     assert.ok(res.stdout.includes('REJECTED: Read-only directory modified'));
     assert.ok(res.stdout.includes('!! read-only dir touched:'));
+  });
+});
+
+test('worker rejects a job that wrote outside the writable directories', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    const elsewhere = path.join(root, 'elsewhere');
+    const res = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'outside', '--task', taskFile, '--workdir', workDir],
+      makeEnv(stateHome, { FAKE_BACKEND_MODE: 'outside', FAKE_BACKEND_OUTSIDE_DIR: elsewhere })
+    );
+    assert.equal(res.code, 3);
+    assert.ok(res.stdout.includes('REJECTED: Wrote 1 file(s) outside the writable directories'));
+    assert.ok(res.stdout.includes(`!! written outside writable dirs: ${path.join(elsewhere, 'stray.txt')}`));
+  });
+});
+
+test('worker accepts writes to an extra --write-dir', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    const extra = path.join(root, 'extra');
+    const res = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'extra', '--task', taskFile, '--workdir', workDir, '--write-dir', extra],
+      makeEnv(stateHome, { FAKE_BACKEND_MODE: 'outside', FAKE_BACKEND_OUTSIDE_DIR: extra })
+    );
+    assert.equal(res.code, 0, res.stdout);
+    assert.ok(!res.stdout.includes('!!'));
+  });
+});
+
+test('worker full access runs in the workdir and lists commands and denied steps', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    // A read-only directory whose name sorts before the workdir: agy would make
+    // it the command directory if it were passed with --add-dir.
+    const roDir = path.join(root, 'aaa-data');
+    fs.mkdirSync(roDir, { recursive: true });
+    const captureFile = path.join(root, 'capture-full.json');
+    const res = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'cmds', '--task', taskFile, '--workdir', workDir, '--read-dir', roDir, '--access', 'full'],
+      makeEnv(stateHome, { FAKE_BACKEND_MODE: 'commands', FAKE_BACKEND_CAPTURE_FILE: captureFile })
+    );
+    assert.equal(res.code, 0, res.stdout);
+    const captured = JSON.parse(fs.readFileSync(captureFile, 'utf8'));
+    assert.equal(path.resolve(captured.cwd), path.resolve(workDir));
+    assert.ok(!captured.argv.includes('--add-dir'));
+    assert.ok(res.stdout.includes('Commands run (not audited for file writes):'));
+    assert.ok(res.stdout.includes('$ node build.mjs'));
+    assert.ok(res.stdout.includes('x Remove-Item old.txt'));
+    assert.ok(res.stdout.includes('Denied by the permission rules:'));
+    assert.ok(res.stdout.includes('Permission denied for unsandboxed(Remove-Item old.txt)'));
   });
 });
 
