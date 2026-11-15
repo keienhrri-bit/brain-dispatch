@@ -6,6 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
 import { CONTEXT_LIMIT, FALLBACK_HINT, PROMPT_INLINE_LIMIT, getRepoRoot, toSlash } from '../scripts/lib/core.mjs';
+import { acquireLease } from '../scripts/lib/coordination.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -363,7 +364,7 @@ test('worker accepts writes to an extra --write-dir', async () => {
     const res = await runNode(
       WORKER_SCRIPT,
       ['--name', 'extra', '--task', taskFile, '--workdir', workDir, '--write-dir', extra],
-      makeEnv(stateHome, { FAKE_BACKEND_MODE: 'outside', FAKE_BACKEND_OUTSIDE_DIR: extra })
+      makeEnv(stateHome, { FAKE_BACKEND_MODE: 'outside', FAKE_BACKEND_OUTSIDE_DIR: extra, FAKE_BACKEND_REPORT_OUTSIDE: '1' })
     );
     assert.equal(res.code, 0, res.stdout);
     assert.ok(!res.stdout.includes('!!'));
@@ -706,7 +707,7 @@ test('worker --follow-up rejects conversation id mismatch with exit 3 and handle
       )
     );
 
-    // Dry-run prints Follow-up of line right after Job dir and skips backend.
+    // A failed resume cannot be bypassed by selecting its older parent, even in dry-run.
     const dryCapture = path.join(root, 'dry-capture.json');
     const seedDir = path.join(
       stateHome,
@@ -718,19 +719,13 @@ test('worker --follow-up rejects conversation id mismatch with exit 3 and handle
       ['--name', 'dryfu', '--follow-up', 'seed', '--task', taskFile, '--dry-run'],
       makeEnv(stateHome, { FAKE_BACKEND_CAPTURE_FILE: dryCapture })
     );
-    assert.equal(dryRes.code, 0, dryRes.stderr);
+    assert.equal(dryRes.code, 2, dryRes.stderr);
     assert.equal(fs.existsSync(dryCapture), false);
-    const dryLines = dryRes.stdout.split(/\r?\n/);
-    const jobDirIdx = dryLines.findIndex((l) => l.startsWith('Job dir: '));
-    assert.ok(jobDirIdx >= 0);
-    assert.equal(
-      dryLines[jobDirIdx + 1],
-      `Follow-up of: ${path.normalize(seedDir)} (conversation conv-seed)`
-    );
+    assert.match(dryRes.stderr, /rejected or unfinished attempt/);
   });
 });
 
-test('worker --follow-up drops deleted context file silently and rejects missing workdir', async () => {
+test('worker --follow-up refuses deleted context and missing workdir before invoking the backend', async () => {
   await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
     const contextFile = path.join(root, 'ephemeral.md');
     fs.writeFileSync(contextFile, 'Temporary context.\n', 'utf8');
@@ -754,19 +749,9 @@ test('worker --follow-up drops deleted context file silently and rejects missing
         FAKE_BACKEND_CONVERSATION_ID: 'conv-ctx-1',
       })
     );
-    assert.equal(noCtxFollow.code, 0, noCtxFollow.stderr);
-    const followFolder = fs
-      .readdirSync(path.join(stateHome, 'jobs'))
-      .find((n) => n.endsWith('_afterdelctx'));
-    const followPrompt = fs.readFileSync(
-      path.join(stateHome, 'jobs', followFolder, 'prompt.md'),
-      'utf8'
-    );
-    const followMeta = JSON.parse(
-      fs.readFileSync(path.join(stateHome, 'jobs', followFolder, 'meta.json'), 'utf8')
-    );
-    assert.ok(!followPrompt.includes('# Shared context'));
-    assert.equal(followMeta.context_file, null);
+    assert.equal(noCtxFollow.code, 2, noCtxFollow.stderr);
+    assert.match(noCtxFollow.stderr, /Context file not found/);
+    assert.ok(!fs.readdirSync(path.join(stateHome, 'jobs')).some((n) => n.endsWith('_afterdelctx')));
 
     fs.rmSync(workDir, { recursive: true, force: true });
     const missingWorkRes = await runNode(
@@ -780,5 +765,100 @@ test('worker --follow-up drops deleted context file silently and rejects missing
         `Working directory of the earlier job no longer exists: ${path.normalize(workDir)}`
       )
     );
+  });
+});
+
+for (const [mode, access, reason] of [
+  ['unreported', 'write', /changed file\(s\) were not reported/],
+  ['delete', 'full', /protocol forbids deletion/],
+  ['failed-report', 'write', /Backend failed despite a report/],
+  ['read-write', 'read', /Read-only directory modified/],
+]) {
+  test(`worker rejects ${mode} even when the backend returns a valid done report`, async () => {
+    await withTempWorkspace(async ({ stateHome, workDir, taskFile }) => {
+      fs.mkdirSync(workDir);
+      fs.writeFileSync(path.join(workDir, 'keep.txt'), 'preserve me\n');
+      const result = await runNode(WORKER_SCRIPT, ['--name', mode, '--task', taskFile, '--workdir', workDir, '--access', access],
+        makeEnv(stateHome, { FAKE_BACKEND_MODE: mode }));
+      assert.equal(result.code, 3, result.stdout + result.stderr);
+      assert.match(result.stdout, reason);
+      assert.deepEqual(fs.readdirSync(path.join(stateHome, 'active')), []);
+    });
+  });
+}
+
+test('worker enforces follow-up caps across siblings without making the refused backend call', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    const env = makeEnv(stateHome);
+    const seed = await runNode(WORKER_SCRIPT, ['--name', 'seed', '--task', taskFile, '--workdir', workDir], env);
+    assert.equal(seed.code, 0, seed.stdout + seed.stderr);
+    const dry = await runNode(WORKER_SCRIPT, ['--name', 'dry', '--task', taskFile, '--follow-up', 'seed', '--dry-run'], env);
+    assert.equal(dry.code, 0, dry.stderr);
+    assert.match(dry.stdout, /Follow-up of:.*conversation fake-conv-ok/);
+    for (const name of ['fix1', 'fix2']) {
+      const fix = await runNode(WORKER_SCRIPT, ['--name', name, '--task', taskFile, '--follow-up', 'seed'], env);
+      assert.equal(fix.code, 0, fix.stdout + fix.stderr);
+    }
+    const capture = path.join(root, 'refused-call.json');
+    const refused = await runNode(WORKER_SCRIPT, ['--name', 'fix3', '--task', taskFile, '--follow-up', 'seed'],
+      makeEnv(stateHome, { FAKE_BACKEND_CAPTURE_FILE: capture }));
+    assert.equal(refused.code, 2, refused.stdout);
+    assert.match(refused.stderr, /Follow-up limit reached \(2\/2\)/);
+    assert.equal(fs.existsSync(capture), false);
+    assert.equal(fs.readFileSync(path.join(stateHome, 'ledger.jsonl'), 'utf8').trim().split('\n').length, 3);
+    assert.deepEqual(fs.readdirSync(path.join(stateHome, 'active')), []);
+  });
+});
+
+test('worker refuses a configured reported-token threshold before another call', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    fs.writeFileSync(path.join(stateHome, 'config.json'), JSON.stringify({ worker: { maxReportedTokens: 1234 } }));
+    const first = await runNode(WORKER_SCRIPT, ['--name', 'seed', '--task', taskFile, '--workdir', workDir], makeEnv(stateHome));
+    assert.equal(first.code, 0, first.stdout + first.stderr);
+    const capture = path.join(root, 'refused-call.json');
+    const result = await runNode(WORKER_SCRIPT, ['--name', 'extra', '--task', taskFile, '--follow-up', 'seed'],
+      makeEnv(stateHome, { FAKE_BACKEND_CAPTURE_FILE: capture }));
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /Reported-token threshold reached/);
+    assert.equal(fs.existsSync(capture), false);
+  });
+});
+
+test('worker rejects overlapping active jobs and releases its lease after completion', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    const release = await acquireLease({ stateHome, jobDir: 'existing-owner', writes: [workDir] });
+    try {
+      const capture = path.join(root, 'refused-call.json');
+      const result = await runNode(WORKER_SCRIPT, ['--name', 'overlap', '--task', taskFile, '--workdir', workDir],
+        makeEnv(stateHome, { FAKE_BACKEND_CAPTURE_FILE: capture }));
+      assert.equal(result.code, 2);
+      assert.match(result.stderr, /Conflicting active job: existing-owner/);
+      assert.equal(fs.existsSync(capture), false);
+    } finally { release(); }
+    const result = await runNode(WORKER_SCRIPT, ['--name', 'available', '--task', taskFile, '--workdir', workDir], makeEnv(stateHome));
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.deepEqual(fs.readdirSync(path.join(stateHome, 'active')), []);
+  });
+});
+
+test('worker records the context bytes it actually sent and refreshes them on a follow-up', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    const context = path.join(root, 'context.md');
+    fs.writeFileSync(context, 'Decision version one.');
+    const first = await runNode(WORKER_SCRIPT, ['--name', 'seed', '--task', taskFile, '--workdir', workDir, '--context', context], makeEnv(stateHome));
+    assert.equal(first.code, 0, first.stdout + first.stderr);
+    const metaFor = (name) => JSON.parse(fs.readFileSync(path.join(stateHome, 'jobs',
+      fs.readdirSync(path.join(stateHome, 'jobs')).find((n) => n.endsWith(`_${name}`)), 'meta.json'), 'utf8'));
+    const original = metaFor('seed');
+    assert.match(original.context_sha256, /^[0-9a-f]{64}$/);
+    assert.equal(original.context_chars, 'Decision version one.'.length);
+    assert.ok(original.prompt_chars > original.context_chars);
+    fs.writeFileSync(context, 'Decision version two.');
+    const next = await runNode(WORKER_SCRIPT, ['--name', 'next', '--task', taskFile, '--follow-up', 'seed'], makeEnv(stateHome));
+    assert.equal(next.code, 0, next.stdout + next.stderr);
+    const current = metaFor('next');
+    assert.notEqual(current.context_sha256, original.context_sha256);
+    assert.equal(current.continuation.followUps, 0);
+    assert.equal(current.continuation.reportedTokens, 1234);
   });
 });

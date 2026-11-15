@@ -136,9 +136,31 @@ switch (mode) {
     writeWithTool(outFile, 'fake backend output\n');
     const stray = path.join(process.env.FAKE_BACKEND_OUTSIDE_DIR, 'stray.txt');
     writeWithTool(stray, 'written outside the writable directories\n');
-    emit(okResult([{ path: outFile, what: 'Created fake output file' }]));
+    const files = [{ path: outFile, what: 'Created fake output file' }];
+    if (process.env.FAKE_BACKEND_REPORT_OUTSIDE) files.push({ path: stray, what: 'Created extra file' });
+    emit(okResult(files));
     break;
   }
+
+  case 'unreported':
+    writeWithTool(path.join(process.cwd(), 'unreported.txt'), 'not listed\n');
+    emit(okResult([]));
+    break;
+
+  case 'delete':
+    fs.unlinkSync(path.join(process.cwd(), 'keep.txt'));
+    emit(okResult([]));
+    break;
+
+  case 'failed-report':
+    emit(okResult([]), 1);
+    break;
+
+  case 'read-write':
+    // Simulate a backend regression not visible in its tool stream.
+    fs.writeFileSync(path.join(process.cwd(), 'silent.txt'), 'unexpected change\n');
+    emit(okResult([{ path: path.join(process.cwd(), 'silent.txt'), what: 'unexpected' }]));
+    break;
 
   case 'commands': {
     const outFile = path.join(process.cwd(), 'output.txt');

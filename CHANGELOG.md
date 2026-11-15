@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+Bound the coordination overhead before adding more agents. No runtime dependencies, daemon, model router or new provider adapter.
+
+- **Continuation has preflight limits.** `worker.maxFollowUps` defaults to 2 across a conversation, including sibling follow-ups. Only accepted done/partial jobs in the same state home can continue. Rejected or unfinished attempts cannot be bypassed by selecting an older parent. Optional `worker.maxReportedTokens` checks reported usage before another continuation and fails closed when usage is unknown. It is not a hard per-call quota cap or a billing estimate.
+- **Local concurrency ownership.** Leases reject overlapping writers, conflicts with declared readers/context files, and simultaneous resumes of one conversation. Disjoint jobs remain parallel. Leases are never stolen automatically after a crash; an orphan can have a live backend child. The scope is one local `BRAIN_DISPATCH_HOME`, not arbitrary editors or distributed hosts.
+- **Unique attempt directories.** Milliseconds and a random suffix prevent same-second/same-name launches overwriting one another. Old job directory names still resolve. `attempt.json` records the requested conversation before launch; attempt and final metadata are published with an atomic rename.
+- **Context provenance.** Missing context now stops a follow-up. Hash the exact bytes injected, compare those with the file after execution, and record `context_sha256`, `context_chars`, `prompt_chars` and the continuation preflight observation.
+- **Stricter acceptance.** Unreported file changes, deletions, and backend failure despite a valid report now reject the run. Read-only directories are compared at every access tier; read-mode work directories are also watched. Tool-write auditing respects protected descendants inside a writable root. Artifacts are retained, not rolled back.
+- **Read-only usage inspection.** `node scripts/stats.mjs [--workdir <dir>] [--json]` summarizes captured metadata, including failed/partial jobs and unknown usage. It does not launch models or read prompt/event bodies. Backend totals are not money, subscription quota or an end-to-end savings measurement.
+- **Research and validation.** Added a source-linked coordination review and Windows/Linux CI on Node 18/24. A Hydrogen worker implemented the statistics command; the primary agent reviewed and integrated it. Existing permissions and the lack of an OS sandbox remain unchanged.
+
+Behavior changes: a formerly accepted unreported/deleting/failed-backend run now exits 3. Invalid continuation history, exhausted preflight limits and active conflicts exit 2 without starting another backend. Old incomplete metadata can remain readable by the stats command but is not a valid continuation checkpoint.
+
 ## 0.3.0
 
 The plugin now adapts to the machine it is installed on, and a failed dispatch no longer costs a rewrite.

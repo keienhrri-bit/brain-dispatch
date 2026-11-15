@@ -1,7 +1,7 @@
 {
   "name": "brain-dispatch",
   "displayName": "Brain Dispatch",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Keep your main Claude session as the brain. Hand bulk legwork to a Gemini worker on the Antigravity CLI, or to Sonnet and Haiku subagents when it is not there, with enforced permissions, measured file changes and one shared context file.",
   "author": {
     "name": "keienhrri-bit",

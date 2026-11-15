@@ -16,13 +16,13 @@ import {
   diffSnapshots,
   expandHome,
   findBackend,
-  formatJobStamp,
   formatLocalIso,
   formatReport,
   formatShortOutput,
   getRepoRoot,
   getStateHome,
   judgeRun,
+  isInside,
   loadConfig,
   normalizePath,
   parseBackendOutput,
@@ -37,6 +37,7 @@ import {
   validateDirectories,
   writesOutside,
 } from './lib/core.mjs';
+import { acquireLease, createJobDirectory, inspectContinuation, writeJobJson } from './lib/coordination.mjs';
 import { applyProxyEnv, resolveBackendProxy } from './lib/proxy.mjs';
 
 const USAGE = `Usage: node scripts/worker.mjs --name <name> --task <task.md> --workdir <dir> [options]
@@ -209,26 +210,23 @@ async function main() {
 
   let contextFile = null;
   let contextText = null;
+  let contextHash = null;
   if (requestedContext !== null) {
     const candidateContext = normalizePath(expandHome(requestedContext, homeDir), platform);
     let contextStat = null;
     try {
       contextStat = fs.statSync(candidateContext);
-    } catch (err) {
-      if (followUp && (err?.code === 'ENOENT' || err?.code === 'ENOTDIR')) {
-        contextStat = null;
-      } else {
-        throw new ValidationError(`Context file not found: ${candidateContext}`);
-      }
+    } catch {
+      throw new ValidationError(`Context file not found: ${candidateContext}`);
     }
     if (contextStat) {
       if (!contextStat.isFile()) {
-        if (!followUp) {
-          throw new ValidationError(`Context file not found: ${candidateContext}`);
-        }
+        throw new ValidationError(`Context file not found: ${candidateContext}`);
       } else {
         contextFile = candidateContext;
-        contextText = stripBom(fs.readFileSync(contextFile, 'utf8')).trim();
+        const contextBytes = fs.readFileSync(contextFile);
+        contextHash = crypto.createHash('sha256').update(contextBytes).digest('hex');
+        contextText = stripBom(contextBytes.toString('utf8')).trim();
         if (!contextText) {
           throw new ValidationError(`Context file is empty: ${contextFile}`);
         }
@@ -304,9 +302,26 @@ async function main() {
     writable: dirs.writable,
   });
 
-  const stamp = formatJobStamp();
-  const jobDir = path.join(stateHome, 'jobs', `${stamp}_${opts.name}`);
-  fs.mkdirSync(jobDir, { recursive: true });
+  const jobDir = createJobDirectory(stateHome, opts.name);
+  let continuation = null;
+  // Hold the lease through metadata persistence, so the next job observes the
+  // completed attempt and its audit before deciding whether it can continue.
+  let releaseLease = null;
+  if (!opts.dryRun) {
+    releaseLease = await acquireLease({
+      stateHome, jobDir, conversationId: followUp?.conversationId ?? null,
+      reads: [...dirs.readDirs, ...(access === 'read' ? [dirs.workDir] : []), ...(contextFile ? [contextFile] : [])],
+      writes: dirs.writable,
+    });
+    process.once('exit', () => {
+      try { releaseLease(); } catch { /* Keep the orphan visible for inspection. */ }
+    });
+  }
+  if (followUp) {
+    continuation = inspectContinuation({ stateHome, followUp,
+      maxFollowUps: loaded.config.worker.maxFollowUps,
+      maxReportedTokens: loaded.config.worker.maxReportedTokens });
+  }
 
   const settingsFile = path.join(jobDir, 'settings.json');
   fs.writeFileSync(settingsFile, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
@@ -361,10 +376,16 @@ async function main() {
   }
 
   const watchRW = uniquePaths([dirs.workDir, ...dirs.writeDirs], platform);
-  const watchRO = access === 'full' ? dirs.readDirs : [];
+  const watchRO = uniquePaths([
+    ...dirs.readDirs,
+    ...(access === 'read' ? [dirs.workDir, ...dirs.writeDirs] : []),
+    ...dirs.writeDeny.filter((d) => dirs.writable.some((w) => isInside(d, w, platform))),
+  ], platform);
   const beforeRW = takeSnapshot(watchRW, platform);
   const beforeRO = takeSnapshot(watchRO, platform);
-  const beforeContextHash = contextFile ? hashFile(contextFile) : null;
+  // Compare with the bytes actually injected, not a second pre-run read that
+  // could silently bless an edit between reading the context and dispatching.
+  const beforeContextHash = contextHash;
 
   const proxyUrl = await resolveBackendProxy({
     configProxy: loaded.config.proxy,
@@ -381,6 +402,11 @@ async function main() {
   const timeoutMs = Math.max(1, Math.round((opts.timeoutMin * 60 + graceSec) * 1000));
 
   const startMs = Date.now();
+  writeJobJson(path.join(jobDir, 'attempt.json'), {
+    started: new Date(startMs).toISOString(),
+    conversation_id: followUp?.conversationId ?? null,
+    follow_up_of: followUp?.jobDir ?? null,
+  });
   let runResult;
   try {
     runResult = await runBackend({
@@ -427,6 +453,7 @@ async function main() {
   const outside = writesOutside({
     written: parsed.written,
     writable: dirs.writable,
+    writeDeny: dirs.writeDeny,
     workDir: dirs.workDir,
     platform,
   });
@@ -439,6 +466,8 @@ async function main() {
     stdout: runResult.stdout,
     parsed,
     missing,
+    unreported,
+    deleted,
     roTouched,
     contextChanged,
     outside,
@@ -498,6 +527,10 @@ async function main() {
     task_file: taskFile,
     context_file: contextFile,
     context_changed: contextChanged,
+    context_sha256: contextHash,
+    prompt_chars: prompt.length,
+    context_chars: contextText?.length ?? 0,
+    continuation,
     created,
     modified,
     deleted,
@@ -512,7 +545,7 @@ async function main() {
     conversation_id: parsed.conversationId,
     usage: parsed.usage,
   };
-  fs.writeFileSync(path.join(jobDir, 'meta.json'), `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
+  writeJobJson(path.join(jobDir, 'meta.json'), meta);
 
   const ledgerEntry = {
     time: formatLocalIso(),
@@ -534,6 +567,8 @@ async function main() {
     `${JSON.stringify(ledgerEntry)}\n`,
     'utf8'
   );
+
+  releaseLease();
 
   process.stdout.write(formatShortOutput(lines, reportMdPath));
   if (exit === 5) {

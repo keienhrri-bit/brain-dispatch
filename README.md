@@ -52,6 +52,9 @@ flowchart LR
 - **A failed dispatch costs no rewrite.** Timeouts, missing sign-in, quota, denied actions and files that do not reconcile each have their own exit code. When the worker is unavailable, the dispatcher names the subagent that takes the same brief file.
 - **One more step costs a few lines.** `--follow-up` continues an earlier job in the same `agy` conversation. The worker keeps what it read, the brain writes a short note instead of a new brief, and the same permission rules and file audit apply.
 - **One shared context file.** Settled decisions and conventions are written once by the brain and put in front of every job. The worker's file tools are denied writes to it, and a run during which it changed anyway is rejected.
+- **Bounded continuation.** Two follow-ups per conversation by default, counted across sibling attempts as well as chains. An optional reported-token threshold stops further continuation before another backend call.
+- **One owner for overlapping work.** Local leases reject concurrent writes to overlapping directories and concurrent continuation of the same conversation. Independent directories can still run in parallel.
+- **Visible usage.** `node scripts/stats.mjs` summarizes captured jobs, failures, partial results, follow-ups and backend-reported tokens, keeping unknown usage separate from zero.
 - **No git required.** The audit compares directory snapshots, so it works on a folder of documents or data as well as on a repository.
 - **Small.** Two skills, three subagents, one hook, one dispatcher script. No npm packages, no MCP server, no background daemon.
 - **The brain stays in charge.** There is no automatic routing. The main session decides what to hand off, and the skill tells it when *not* to.
@@ -60,7 +63,9 @@ flowchart LR
 
 Handing work off is not free: the brain writes a brief, waits, and checks the result. On small self-contained tasks that overhead is larger than the saving. It pays on chunks: forty files to read, a table to build from raw material, a script to write and run, a long document to type out.
 
-There is no benchmark of this plugin yet, and this README will not quote a saving until there is one. Two similar projects have published numbers, each from one run per task, and they show the shape to expect. [antigravity-for-claude-code](https://github.com/yuting0624/antigravity-for-claude-code/blob/master/docs/AB-RESULTS.md): Claude-side cost fell by about 27% on a large build and rose by about 40% on a small one. [agy-staff](https://github.com/keli-wen/agy-staff): Claude Code's spend fell by 16% to 39% on three benchmarks, while the median time per task rose from 2–8 minutes to 13–26. Handing off trades the expensive model's tokens for wall-clock time.
+There is no controlled cost benchmark of this plugin yet, so this README does not claim a saving. Related projects show why measurement matters. [antigravity-for-claude-code](https://github.com/yuting0624/antigravity-for-claude-code) reports an eight-PR replay, two runs per cell: whole-task hand-off cost 0.58× per passing task under its registered price assumptions, while file-by-file delegation cost 1.33–1.68×. At its actual higher Gemini rate the overall saving disappeared. [agy-staff](https://github.com/keli-wen/agy-staff) reports one run per task/setup: Claude-side spend fell across its three benchmarks, but Codex-side spend increased on two, and median time rose. These are their experiments, not transferable guarantees about subscription quota.
+
+The [coordination research and implementation review (Chinese)](docs/coordination-review.zh-CN.md) compares existing projects and six papers, explains the narrow scope, and separates measured behavior from open questions.
 
 Subagents on Sonnet and Haiku still draw on your Claude plan, at a lower rate. Only the Gemini worker costs it nothing.
 
@@ -96,11 +101,30 @@ After setup you mostly do nothing. A short note at session start tells the main 
 
 When one piece of work needs several hand-offs, the brain keeps a single context file (goal, settled decisions, conventions, where things are, what is still open) and passes it to every job with `--context`. Background is written once instead of once per brief, and every job starts from the same decisions. Only the brain edits the file. Results move between roles as file paths, not as pasted text.
 
+`meta.json` records `context_sha256` for the exact file bytes injected, plus `context_chars` and `prompt_chars`. A missing or invalid context file stops a follow-up; it is never silently discarded. Context is still sent on each call: a shared file is not shared model memory or a provider prompt-cache guarantee.
+
 ### Follow-ups
 
 When a job comes back incomplete, or wrong in one place, the brain sends a follow-up instead of a new brief: `--follow-up <job>` resumes the same `agy` conversation with a short note. Directories, access level, model and context file come from the earlier job, and the run is audited like any other. If `agy` cannot find the conversation it starts a new one and still exits with 0, so the dispatcher compares conversation ids and rejects that run.
 
 A follow-up saves the brain a brief and saves the worker a second pass over its material. It does not make the worker's run cheaper: the backend sends the earlier conversation again on every resumed call, and a similar project [measured](https://github.com/yuting0624/antigravity-for-claude-code/blob/master/skills/antigravity/SKILL.md) a resumed call costing more than a fresh one on a large corpus. Use it to fix or finish a job, not to start a new one.
+
+Only an accepted `done` or `partial` job in the current `BRAIN_DISPATCH_HOME` can continue. The default `worker.maxFollowUps` is 2; selecting the original parent again does not reset that count. A rejected or unfinished attempt in that conversation requires reviewing its artifacts and starting a fresh, narrower job. `worker.maxReportedTokens`, when set, blocks another follow-up once the sum of captured `usage.total_tokens` reaches the threshold; unknown earlier usage also blocks it. This is a conservative preflight threshold, not a live per-call limit, billing estimate or subscription-quota cap. A call already in progress can exceed it, and cumulative backend counters may be counted more than once.
+
+### Concurrent jobs
+
+Every non-dry run holds a local lease through its file audit and metadata write. Jobs using the same state home cannot simultaneously write overlapping directories, write another job's declared read directory/context file, or resume the same conversation. Readers may coexist. Give independent workers separate directories or worktrees; the brain should also avoid editing a running worker's directories.
+
+Conflicts exit with code 2 before starting `agy`; there is no retry loop or hidden queue. The lease registry lives in `$BRAIN_DISPATCH_HOME/active`. Normal completion releases it. After a forced kill, inspect the named dispatcher **and its backend child** before removing that specific orphaned lease; do not clear active records wholesale. A leftover `.registration` directory likewise requires checking running dispatchers. Leases coordinate this dispatcher only, within one local state home. Other programs, other state homes and remote hosts are outside their scope.
+
+### Inspect usage
+
+```bash
+node scripts/stats.mjs
+node scripts/stats.mjs --workdir ./scratch --json
+```
+
+This reads only completed `jobs/*/meta.json` records and does not launch a model, read prompt/event bodies, or create state. It includes rejected jobs with usage, distinguishes zero from unknown, and warns about invalid metadata. It excludes the brain's tokens and calls that left no metadata. Treat totals as backend-reported observations: they do not establish money or quota saved. Compare accepted task quality, brain usage, worker usage, repairs and elapsed time against a solo baseline before changing your routing policy.
 
 ### Access levels
 
@@ -130,7 +154,7 @@ Full report: ~/.brain-dispatch/jobs/20261114-213005_timeouts/report.md
 
 File lines: `+` created · `~` modified · `-` deleted · `!` reported but missing · `?` changed but not reported · `!!` a read-only directory was touched, a file was written outside the writable directories, or the shared context file was modified. Two more sections appear when they apply: **Denied by the permission rules** lists the tool calls the rules refused, and at `full` access **Commands run** lists every command the worker ran.
 
-Exit codes: `0` valid report · `2` bad arguments, a directory rule violated, an unusable context file, or a follow-up whose earlier job cannot be found · `3` rejected (no valid report, blocked, files that do not reconcile, a `!!` line, a follow-up that did not resume its conversation) · `4` timeout, including a run that used up its time limit without a report · `5` backend missing, not signed in, or out of quota; the output names the fallback.
+Exit codes: `0` accepted report (including `partial`; the brain still reviews quality) · `2` invalid arguments/context/history, an active-job conflict, or a continuation limit · `3` rejected (invalid/blocked report, failed backend, missing or unreported files, deleted files, a `!!` line, or a conversation mismatch) · `4` timeout · `5` backend unavailable; the output names the fallback. Rejection retains artifacts for inspection; it does not undo changes.
 
 ## Choosing the brain
 
@@ -146,7 +170,7 @@ If you would rather run a cheaper main model, Claude Code's [advisor](https://co
 
 ```json
 {
-  "worker": { "model": "gemini-4-hydrogen", "effort": "high", "timeoutMin": 20 },
+  "worker": { "model": "gemini-4-hydrogen", "effort": "high", "timeoutMin": 20, "maxFollowUps": 2, "maxReportedTokens": null },
   "protect": [],
   "proxy": null,
   "agy": null,
@@ -158,12 +182,15 @@ If you would rather run a cheaper main model, Claude Code's [advisor](https://co
 |---|---|
 | `worker.model`, `worker.effort` | Joined into the model id passed to `agy`, for example `gemini-4-hydrogen-high`. Any model `agy models` lists will do |
 | `worker.timeoutMin` | Default time limit per job |
+| `worker.maxFollowUps` | Nonnegative integer; maximum follow-up attempts per conversation (default 2, 0 disables continuation) |
+| `worker.maxReportedTokens` | Optional positive integer; conservative reported-token preflight threshold for continuation, default `null` |
 | `protect` | Extra directories no job may write to |
 | `proxy` | Proxy URL for the backend process, if it does not pick up your system proxy |
 | `agy` | Full path to the `agy` executable when it is not on `PATH` |
 | `policyHook` | `false` turns off the note printed at session start |
 
 Set `BRAIN_DISPATCH_HOME` to keep config, job files and the ledger somewhere other than `~/.brain-dispatch`.
+Keep it outside the working, writable and read-only directories being audited; otherwise the dispatcher's own logs would invalidate its snapshots, so the run is refused before launch.
 
 ## Use the dispatcher on its own
 
@@ -188,9 +215,9 @@ node scripts/doctor.mjs                                                         
 
 ## Status and scope
 
-Version 0.3.0. Developed on Windows 11 with Node 24 and `agy` 1.5.9. The dispatcher is a Node port of a PowerShell script that has run real jobs. It ships with automated tests that run against a fake backend, and the permission rules, the command directory and the write audit have been checked against real `agy` runs. The code is written to be cross-platform, but macOS and Linux have not been exercised yet; reports and fixes are welcome.
+Version 0.4.0. Developed on Windows 11 with Node 24 and `agy` 1.5.9. Tests cover a fake backend, coordination conflicts, failed hand-offs and usage inspection. CI runs the suite on Windows and Linux with Node 18 and 24. Real `agy` integration has been exercised on Windows; Linux/macOS backend behavior is not established by fake-backend CI.
 
-Scope is deliberate: Claude Code plus the Antigravity CLI. Roles on other vendors' command-line tools are not planned. Not included yet: a measured benchmark and per-job cost accounting.
+Scope is deliberate: a Claude Code plugin plus a host-independent Antigravity dispatcher. Roles on other vendors' command-line tools are not planned. Not included yet: a controlled cost benchmark, provider billing/quota accounting, a distributed scheduler or automatic model routing.
 
 ## Develop
 

@@ -8,6 +8,8 @@ export const DEFAULT_CONFIG = Object.freeze({
     model: 'gemini-4-hydrogen',
     effort: 'high',
     timeoutMin: 20,
+    maxFollowUps: 2,
+    maxReportedTokens: null,
   }),
   protect: Object.freeze([]),
   proxy: null,
@@ -189,9 +191,20 @@ export function mergeConfig(raw) {
     ? obj.worker
     : {};
 
+  if (workerRaw.maxFollowUps !== undefined &&
+      (!Number.isSafeInteger(workerRaw.maxFollowUps) || workerRaw.maxFollowUps < 0)) {
+    throw new ValidationError('worker.maxFollowUps must be a nonnegative integer');
+  }
+  if (workerRaw.maxReportedTokens !== undefined && workerRaw.maxReportedTokens !== null &&
+      (!Number.isSafeInteger(workerRaw.maxReportedTokens) || workerRaw.maxReportedTokens <= 0)) {
+    throw new ValidationError('worker.maxReportedTokens must be a positive integer or null');
+  }
+
   return {
     ...obj,
     worker: {
+      maxFollowUps: workerRaw.maxFollowUps ?? DEFAULT_CONFIG.worker.maxFollowUps,
+      maxReportedTokens: workerRaw.maxReportedTokens ?? null,
       model:
         typeof workerRaw.model === 'string' && workerRaw.model.trim()
           ? workerRaw.model.trim()
@@ -318,7 +331,7 @@ export function parseWorkerArgs(argv, config = mergeConfig({})) {
     }
 
     if (val === null) {
-      if (i + 1 >= argv.length) {
+      if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) {
         throw new ValidationError(`Missing value for ${flag}`);
       }
       val = argv[i + 1];
@@ -457,7 +470,7 @@ export function resolveFollowUp({ ref, stateHome, platform = process.platform })
     for (const entry of entries) {
       if (!entry.name.endsWith(suffix)) continue;
       // The rest must be the time stamp alone, so "fix" does not match a job named "pre_fix".
-      if (!/^\d{8}-\d{6}$/.test(entry.name.slice(0, -suffix.length))) continue;
+      if (!/^\d{8}-\d{6}(?:-\d{3}-[0-9a-f]{12})?$/.test(entry.name.slice(0, -suffix.length))) continue;
       const fullPath = path.join(jobsDir, entry.name);
       let isDir = entry.isDirectory();
       if (!isDir && entry.isSymbolicLink()) {
@@ -583,6 +596,13 @@ export function validateDirectories({
 
   const writable =
     access === 'read' ? [] : uniquePaths([normWorkDir, ...normWriteDirs], platform, cwd);
+
+  const resolvedStateHome = normalizePath(stateHome ?? getStateHome({}, homeDir, platform), platform, cwd);
+  for (const watched of uniquePaths([normWorkDir, ...normWriteDirs, ...normReadDirs], platform, cwd)) {
+    if (isInside(resolvedStateHome, watched, platform, cwd)) {
+      throw new ValidationError('Keep BRAIN_DISPATCH_HOME outside directories being audited; dispatcher logs would otherwise look like worker changes.');
+    }
+  }
 
   for (const w of writable) {
     for (const p of normProtect) {
@@ -1230,12 +1250,13 @@ export function parseBackendOutput(stdout) {
 
 // Paths the worker wrote with its file tools that are outside every writable
 // directory. agy does not block these; the dispatcher reports them.
-export function writesOutside({ written, writable, workDir, platform = process.platform }) {
+export function writesOutside({ written, writable, writeDeny = [], workDir, platform = process.platform }) {
   const outside = new Map();
   for (const raw of written) {
     const resolved = resolveClaimedPath(raw, workDir, platform);
     if (!resolved) continue;
-    if (!writable.some((dir) => isInside(resolved, dir, platform))) {
+    if (!writable.some((dir) => isInside(resolved, dir, platform)) ||
+        writeDeny.some((dir) => isInside(resolved, dir, platform))) {
       outside.set(pathKey(resolved, platform), resolved);
     }
   }
@@ -1250,6 +1271,8 @@ export function judgeRun({
   stdout,
   parsed,
   missing = [],
+  unreported = [],
+  deleted = [],
   roTouched = [],
   contextChanged = false,
   outside = [],
@@ -1329,6 +1352,9 @@ export function judgeRun({
       reason: `Invalid report format: ${parsed.repError}`,
     };
   }
+  if (code !== 0 || parsed.status !== 'SUCCESS') {
+    return { exit: 3, reason: `Backend failed despite a report: exit=${code} status=${parsed.status}` };
+  }
   if (validRep.status === 'blocked') {
     return {
       exit: 3,
@@ -1358,6 +1384,12 @@ export function judgeRun({
       exit: 3,
       reason: `Wrote ${outside.length} file(s) outside the writable directories (see !! lines)`,
     };
+  }
+  if (deleted.length > 0) {
+    return { exit: 3, reason: `Worker deleted ${deleted.length} file(s); the protocol forbids deletion (see - lines)` };
+  }
+  if (unreported.length > 0) {
+    return { exit: 3, reason: `Reconciliation mismatch: ${unreported.length} changed file(s) were not reported (see ? lines)` };
   }
   return { exit: 0, reason: null };
 }
@@ -1393,7 +1425,7 @@ export function formatReport({
   const label = !rep ? 'no-report' : String(rep.status);
   const totalTokens = parsed.usage?.total_tokens;
   const tok =
-    typeof totalTokens === 'number' && Number.isFinite(totalTokens) && totalTokens > 0
+    typeof totalTokens === 'number' && Number.isFinite(totalTokens) && totalTokens >= 0
       ? totalTokens.toLocaleString('en-US')
       : '?';
 

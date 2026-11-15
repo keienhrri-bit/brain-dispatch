@@ -40,7 +40,7 @@ Every hand-off has a fixed cost: you write a brief, wait, and check the result. 
 - **One brief, one kind of deliverable.** A job that must read a dozen sources *and* cross-compare them row by row is two jobs.
 - **Cross-comparison:** first hand off an *index* job (what is in each source, one line per item). Do the comparison yourself from the index, or split it by source.
 - **Large files** (a big CSV, a long log) get a job of their own.
-- Independent jobs can run in parallel, each with its own working directory. Two jobs never write to the same files.
+- Independent jobs can run in parallel, each with its own working directory. Two jobs never write overlapping directories; the brain also waits before editing a running worker's directory. Local leases enforce this for dispatchers sharing one state home, including declared read directories and context files.
 - If you expect a job to run longer than about 15 minutes, split it.
 
 ## Shared context
@@ -51,6 +51,7 @@ When one piece of work needs more than one hand-off, write what every job must k
 - Give it to every worker job with `--context <file>`, and name its path in every subagent prompt.
 - You are its only editor. Update it when a decision changes, but not while a job that was given it is still running: the dispatcher compares the file before and after the run and cannot tell your edit from the worker's. Workers and subagents never write to it: they report problems with it under `open`, and the dispatcher rejects a job that modified it.
 - Move results between roles as file paths, not pasted text. The worker writes files; the writer or the next job reads them. Nothing has to pass through your context twice.
+- A shared file is not shared model memory. Its content is sent each time; provider history/caching may still cost tokens. Keep it to settled constraints and an artifact index, not a growing transcript. `meta.json` captures its hash and prompt/context character counts. Missing context stops continuation instead of dropping it.
 
 ## Write the brief
 
@@ -151,19 +152,21 @@ When a job came back and needs one more step, continue it in the same conversati
 node "${CLAUDE_PLUGIN_ROOT}/scripts/worker.mjs" --follow-up <earlier-job-name> --name <new-name> --task <note.md> [--timeout-min 20]
 ```
 
-- Use it for a `partial` report whose remaining part is clear, a mistake your spot check found, a reported file that is missing, or one more pass over the same material.
+- Use it for an accepted `partial` report whose remaining part is clear, or a semantic mistake your spot check found in an otherwise accepted result. A rejected file audit, failed backend, or missing report requires inspecting the artifacts and a fresh, narrower job.
 - The follow-up takes its directories, access level, model and context file from the earlier job. To change any of them, dispatch a fresh job.
 - The note says what to fix or add and nothing else: no protocol, no background the worker already has. The shared context file is sent again as it is now, so a decision you changed since then reaches the worker.
 - The same permission rules and the same file audit apply. The report covers the follow-up only.
 - A follow-up saves you a brief and saves the worker a second reading pass. It does not make the worker's run cheaper: the earlier conversation is sent to the model again each time. Use it to fix or finish a job, not to start a new one.
-- Stop after two follow-ups on one job. If the result is still wrong, the brief was the problem: rewrite it and dispatch fresh, or do the job yourself.
+- The dispatcher enforces `worker.maxFollowUps` (default 2) across the whole conversation, including siblings that point to the original job. Do not raise limits just to force another retry. Reconsider the brief, start fresh with the necessary artifacts, or finish directly. A rejected/unfinished attempt cannot be bypassed by choosing an older parent.
+- Optional `worker.maxReportedTokens` blocks further follow-ups at the sum of recorded backend tokens, and refuses unknown earlier usage. This is a conservative preflight check, not a live quota limit or billing estimate. Inspect `node "${CLAUDE_PLUGIN_ROOT}/scripts/stats.mjs" [--workdir <dir>]` for recorded successes/failures/partials, unknown usage and per-model totals; do not claim savings without a solo baseline including the brain's usage and review cost.
 - Not for a job that timed out or returned no report (start fresh and narrower), and not for a new task on other material.
 - If the backend cannot find the conversation it silently starts a new one. The dispatcher rejects that run with exit code 3; dispatch a fresh job.
 
 ## When it fails
 
 - **Exit 5:** the worker is not available. Hand the same brief to `brain-dispatch:backup-worker`, or to `brain-dispatch:finder` if the job only reads, and carry on. Tell the user once: not installed means `/brain-dispatch:setup`; signed out means running `agy` in a terminal; out of quota means waiting for the reset. Do not dispatch to the worker again in this session until the user says it is back.
-- **Partial, or wrong in one place:** send a follow-up (above) rather than a new brief.
+- **Accepted partial, or semantically wrong in one place:** consider a bounded follow-up (above).
+- **Exit 2 from coordination:** do not retry in a loop. An active conflict requires waiting for the owner to finish or using an independent directory; a continuation limit or failed history requires reviewing the work and a fresh plan. An orphaned lease must be inspected together with its backend child before that exact record is removed.
 - **Timeout or no report:** look at the Files block. The protocol tells the worker to write as it goes, so finished parts are usually on disk. Narrow the job and hand off the rest, or finish it yourself.
 - **Aborted on a denied action:** the brief asked for something the access level does not allow, such as a command at `write` or a write to a protected or read-only directory. Fix the brief or raise `--access`.
 - **`!! written outside writable dirs`:** the file is already there. Look at it and remove or move it if it should not stay, then fix the brief (use paths relative to the working directory) or add the directory with `--write-dir`.
@@ -185,7 +188,7 @@ Anything with new derivations or judgment calls you write yourself.
 
 ```json
 {
-  "worker": { "model": "gemini-4-hydrogen", "effort": "high", "timeoutMin": 20 },
+  "worker": { "model": "gemini-4-hydrogen", "effort": "high", "timeoutMin": 20, "maxFollowUps": 2, "maxReportedTokens": null },
   "protect": [],
   "proxy": null,
   "agy": null,
