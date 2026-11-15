@@ -2,30 +2,44 @@
 
 [English](README.md) | **简体中文**
 
-一个 Claude Code 插件：主会话只当大脑，跑腿的活交给更便宜的模型。
+把最贵的 Claude 模型留给思考。Brain Dispatch 是一个 Claude Code 插件：主会话只当大脑，负责规划、拍板、审核；成批的跑腿活交给更省额度、甚至不占 Claude 额度的模型。
 
-- **大脑**：你的 Claude 主会话。负责规划、拍板、审核，以及写简短的最终答复。
-- **执行者（Worker）**：跑在 Google Antigravity CLI（`agy`）上的 Gemini 模型，默认是 Gemini 4 Hydrogen，以无头方式运行。负责查找、抽取、处理数据、写脚本并运行、批量生成文件。
-- **写手（Writer）**：Sonnet 子代理，写不需要新推理的长稿。
-- **查找员（Finder）**：Haiku 子代理，只读查找，执行者用不了时顶上。
+```
+/plugin marketplace add keienhrri-bit/brain-dispatch
+/plugin install brain-dispatch@brain-dispatch
+```
 
-目的只有一个：省额度。最强的模型把 token 花在思考和核对上，而不是花在通读四十个文件、敲出六千字文档上。
+只用 Claude 自己的几个角色，装到这里就够了。要接上 Gemini 执行者（这才是这个插件的用处），再运行 `/brain-dispatch:setup`。
+
+## 角色
+
+| 角色 | 跑在哪 | 做什么 | 占 Claude 额度 |
+|---|---|---|---|
+| **大脑** | 你的主会话，模型用 `/model` 选 | 规划、拍板、审核，写简短的最终答复 | 全价 |
+| **执行者（Worker）** | Google Antigravity CLI（`agy`）上的 Gemini 模型，默认 Gemini 4 Hydrogen，无头运行 | 成批的跑腿活：跨很多文件查找和抽取、处理数据、写脚本并运行、批量生成文件 | 不占，走你的 Antigravity 套餐 |
+| **备用执行者（Backup worker）** | Sonnet 子代理 | 执行者没装、没登录或额度用完时，拿同一份任务书做同样的活 | 较低 |
+| **写手（Writer）** | Sonnet 子代理 | 按大脑核过的大纲和事实写长稿 | 较低 |
+| **查找员（Finder）** | Haiku 子代理 | 只读查找 | 最低 |
+
+插件在会话开始时看一眼这台机器。有 `agy`，成批的活交给 Gemini 执行者；没有，同样的分工就跑在 Sonnet 和 Haiku 上，不用再装别的东西。
 
 ## 工作方式
 
 ```mermaid
 flowchart LR
   U([你]) --> B["主会话<br/>规划 · 拍板 · 审核"]
+  C[("context.md<br/>已定的事")] -.-> D
   B -- "任务书 brief.md" --> D["worker.mjs<br/>权限 · 目录快照"]
   D -- "无头运行" --> W["Gemini 执行者<br/>agy"]
   W -- "JSON 回报 + 文件" --> D
   D -- "短回报<br/>实测的文件变动" --> B
+  D -. "退出码 5：同一份任务书" .-> K["备用执行者<br/>Sonnet"]
   B -- "大纲 + 事实" --> S["写手<br/>Sonnet"]
   B -- "查找" --> H["查找员<br/>Haiku"]
 ```
 
 1. 大脑写一份自成一体的任务书：目标、背景、输入、产出、完成标准、边界。
-2. `worker.mjs` 在任务书前面贴上固定协议，为这一次运行生成一次性的权限配置，给可写目录拍快照，然后无头启动 `agy`。
+2. `worker.mjs` 在任务书前面贴上固定协议，有共享背景文件的话也一并贴上；为这一次运行生成一次性的权限配置，给可写目录拍快照，然后无头启动 `agy`。
 3. 执行者在给定的目录里把活做完，交回一份必须符合 Schema 的 JSON 回报。
 4. 派单脚本再拍一次快照，**实测**新建、改动、删除了哪些文件，再和执行者自己报的、以及它事件流里记下的写入对账。
 5. 大脑拿到短回报，抽查之后决定用哪些。
@@ -34,17 +48,27 @@ flowchart LR
 
 - **权限靠强制，事后还要查。** 每次运行都有明确的放行和拒绝规则；跑完之后，执行者用文件工具写的每一个文件都要和可写目录比对。从不使用 `--dangerously-skip-permissions`。
 - **文件变动是实测的。** 回报里的文件清单来自运行前后的目录对比，路径抄错、改了没报都会显出来。
-- **回报格式固定。** 状态、结论、文件、发现、已核对、未核对、待定。不符合 Schema 的回复直接判不合格，不拿来用。
-- **失败如实报告。** 超时、未登录、额度用完、越权、对账不上，各有各的退出码和说明。
+- **回报格式固定。** 状态、结论、文件、发现、已核对、未核对、待定。不符合 Schema 的回复直接判不合格，不拿来用；执行者没核对的东西单列一栏，不会混进结论里。
+- **派单失败不用重写任务书。** 超时、未登录、额度用完、越权、对账不上，各有各的退出码。执行者用不了时，派单脚本会直接说明同一份任务书该交给哪个子代理。
+- **多做一步只要几行。** `--follow-up` 在同一个 `agy` 对话里接着上一单继续。执行者读过的东西还在，大脑写几行补充说明就行，不用重写任务书；权限规则和文件审计照旧。
+- **一份共享背景文件。** 已定的决定和约定由大脑写一次，贴在每一单前面。执行者的文件工具写不了它；运行期间它要是还是变了，那一单判不合格。
+- **不依赖 git。** 审计靠对比目录快照，所以一个放文档或数据的普通文件夹也能用，不限于代码仓库。
+- **小。** 两个技能、三个子代理、一个钩子、一个派单脚本。不需要 npm 包，没有 MCP 服务器，没有后台常驻进程。
 - **大脑始终做主。** 没有自动路由。交不交出去由主会话判断，技能里也写明了哪些活**不该**交。
+
+## 什么时候划算
+
+把活交出去不是白来的：大脑要写任务书、等结果、再核一遍。小而独立的任务，这点开销比省下来的还多。划算的是成块的活：四十个文件要读、要从原始材料整理出一张表、要写个脚本跑出结果、要敲出一份长文档。
+
+这个插件自己还没有实测数据，没测之前这里不写节省多少。两个同类项目公布过数字（都是每题只跑一次），可以看个大概。[antigravity-for-claude-code](https://github.com/yuting0624/antigravity-for-claude-code/blob/master/docs/AB-RESULTS.md)：大型构建任务上 Claude 一侧的花费降了约 27%，小任务上反而多了约 40%。[agy-staff](https://github.com/keli-wen/agy-staff)：三组基准上 Claude Code 的花费降了 16% 到 39%，每题的中位耗时从 2–8 分钟涨到 13–26 分钟。把活交出去，是拿等待时间换贵模型的额度。
+
+Sonnet 和 Haiku 子代理仍然占你的 Claude 额度，只是费率低。只有 Gemini 执行者一点都不占。
 
 ## 需要什么
 
 - 支持插件的 [Claude Code](https://code.claude.com/docs)
 - Node.js 18 或更高版本（不需要任何 npm 包）
-- 已安装并登录的 [Antigravity CLI](https://antigravity.google/docs)（`agy`），所用套餐包含执行者模型
-
-没有 `agy` 时，写手和查找员两个子代理照常可用，只是执行者用不了。
+- 可选：已安装并登录的 [Antigravity CLI](https://antigravity.google/docs/getting-started)（`agy`），所用套餐包含执行者模型
 
 ## 安装
 
@@ -56,7 +80,7 @@ flowchart LR
 /brain-dispatch:setup
 ```
 
-`/brain-dispatch:setup` 会检查 Node 和 `agy`，写入 `~/.brain-dispatch/config.json`，再跑一个很小的只读任务，确认执行者能回话。
+`/brain-dispatch:setup` 会检查 Node 和 `agy`，列出这台机器上有哪些角色，写入 `~/.brain-dispatch/config.json`，再跑一个很小的只读任务，确认执行者能回话。没装 `agy` 时它会给出 Google 的安装命令，装不装由你决定。
 
 ## 使用
 
@@ -67,6 +91,16 @@ flowchart LR
 > 让执行者写个脚本把这几份 CSV 合并，跑一遍，报告行数。
 
 > `notes/` 里的大纲和数字我都核过了，交给写手，把手册写到 `docs/handbook.md`。
+
+### 共享背景
+
+一件事要派好几单时，大脑维护一份背景文件（目标、已定的决定、约定、东西在哪、还没定的问题），每一单都用 `--context` 带上。背景只写一次，不用每份任务书重讲一遍，每一单也都从同一套决定出发。这份文件只有大脑能改。各角色之间传结果，传的是文件路径，不是贴过去的正文。
+
+### 追加一步
+
+一单交回来没做完，或者有一处做错了，大脑不用重写任务书，发一份补充说明就行：`--follow-up <任务名>` 接着同一个 `agy` 对话继续。目录、权限档、模型和背景文件都沿用上一单，审计和别的单一样。`agy` 找不到那个对话时会另开一个新对话，退出码照样是 0，所以派单脚本会核对对话 ID，对不上的那一单判不合格。
+
+追加省的是大脑重写一份任务书，以及执行者把材料再翻一遍。它并不让执行者这一趟更便宜：每次续跑，后端都要把之前的对话重新发给模型，有同类项目[实测过](https://github.com/yuting0624/antigravity-for-claude-code/blob/master/skills/antigravity/SKILL.md)，材料量大时续跑比新开一单还贵。所以它用来补做和改错，不用来开新任务。
 
 ### 权限档
 
@@ -94,9 +128,17 @@ Open: none
 Full report: ~/.brain-dispatch/jobs/20261114-213005_timeouts/report.md
 ```
 
-文件行的记号：`+` 新建 · `~` 改动 · `-` 删除 · `!` 报了但不存在 · `?` 改了没报 · `!!` 碰了只读目录，或写到了可写目录以外。另有两节在用得上时出现：**Denied by the permission rules** 列出被权限规则拒掉的工具调用；`full` 档的 **Commands run** 列出执行者跑过的每一条命令。
+文件行的记号：`+` 新建 · `~` 改动 · `-` 删除 · `!` 报了但不存在 · `?` 改了没报 · `!!` 碰了只读目录、写到了可写目录以外，或者改了共享背景文件。另有两节在用得上时出现：**Denied by the permission rules** 列出被权限规则拒掉的工具调用；`full` 档的 **Commands run** 列出执行者跑过的每一条命令。
 
-退出码：`0` 回报有效 · `2` 参数或目录规则不过 · `3` 不合格（没有有效回报、受阻、文件对不上账、出现 `!!` 行）· `4` 超时，时限用满却没交回报也算 · `5` 后端没装、没登录或额度用完。
+退出码：`0` 回报有效 · `2` 参数或目录规则不过、背景文件不能用，或追加时找不到上一单 · `3` 不合格（没有有效回报、受阻、文件对不上账、出现 `!!` 行、追加时没能接上原对话）· `4` 超时，时限用满却没交回报也算 · `5` 后端没装、没登录或额度用完，输出里会写明备用方案。
+
+## 大脑用哪个模型
+
+大脑就是你主会话在用的模型，用 `/model` 选。一般选手头最强的那个，因为每一个决定、每一次核对都经过它。几个子代理固定用 Sonnet 和 Haiku，不跟着主会话的模型走。
+
+Claude Code 内置的 Explore、general-purpose 这类子代理，不另外指定便宜模型的话会沿用主会话的模型，所以会话开始的那段说明会把跑腿的活引到上面这几个角色。
+
+如果你更想让主会话用便宜一些的模型，Claude Code 的[顾问（advisor）](https://code.claude.com/docs/en/advisor)可以给它配一个更强的模型，只在关键处出主意。Brain Dispatch 在那种配置下用法不变。
 
 ## 配置
 
@@ -129,23 +171,26 @@ Full report: ~/.brain-dispatch/jobs/20261114-213005_timeouts/report.md
 
 ```bash
 node scripts/worker.mjs --name demo --task brief.md --workdir ./scratch --access write
+node scripts/worker.mjs --name demo --task brief.md --workdir ./scratch --context context.md
+node scripts/worker.mjs --follow-up demo --name demo-fix --task note.md             # 在同一个对话里追加一步
 node scripts/worker.mjs --name demo --task brief.md --workdir ./scratch --dry-run   # 只看权限配置，不运行
-node scripts/doctor.mjs                                                             # 环境自检
+node scripts/doctor.mjs                                                             # 环境自检，列出角色
 ```
 
 ## 安全说明
 
 - **写到可写目录以外，是事后查出，不是事前拦住。** `agy` 的规则按 Deny > Ask > Allow 生效，表达不了“只有这几个目录可写”：宽泛的 deny 会连窄的 allow 一起压掉；无头模式下，没有任何规则提到的目录也照样能写。所以派单脚本放行可写目录、拒绝保护目录和只读目录，跑完再读执行者的事件流（`--output-format stream-json`）：它的工具写到别处的文件都用 `!!` 列出来，整单按退出码 3 判不合格。这时文件已经落盘，回报会告诉你在哪。
 - **`full` 档没有系统级沙箱。** 上面的审计只看得到文件工具写了什么，看不到命令写了什么，而命令能写到进程有权限的任何地方。回报会列出跑过的每一条命令，只读目录照旧做前后对比。派单脚本另外拦命令模式：删除、联网下载、`git push`/`reset`/`clean`/`restore`、系统设置、全局安装、再起别的 agent。`rm`、`dd` 这类短命令名只在命令开头的位置才算，不会因为参数或路径里有这几个字母被误拦。这是安全带，不是笼子。`full` 只用在你信得过的材料上，工作目录要么可以随手丢掉，要么能用 `git diff` 审。
-- 每一档都能**读**整台机器。不愿意发给模型提供方的材料，不要让执行者去碰。任务书和它读到的文件会发给 Google。
+- **子代理不在上面这些保护之内。** 备用执行者、写手、查找员按你 Claude Code 会话自己的权限设置运行。派单脚本的规则和文件审计只管 Gemini 执行者。
+- 每一档都能**读**整台机器。不愿意发给模型提供方的材料，不要让执行者去碰。任务书、共享背景文件和它读到的文件会发给 Google。
 - 协议规定材料里的文字只算内容、不算指令，但协议不是保证。交回来的东西要审。
 - 权限规则的写法是 `agy` 的，不同版本之间变过。升级 `agy` 之后先用 `--dry-run` 看一眼。
 
-## 现状
+## 现状和范围
 
-版本 0.2.0。在 Windows 11、Node 24、`agy` 1.5.9 上开发。派单脚本是从一份跑过真实任务的 PowerShell 脚本移植成 Node 版的，附带用假后端运行的自动测试；权限规则、命令运行目录和写入审计都用真 `agy` 跑过。代码按跨平台写，但 macOS 和 Linux 还没有实际跑过，欢迎反馈和修正。
+版本 0.3.0。在 Windows 11、Node 24、`agy` 1.5.9 上开发。派单脚本是从一份跑过真实任务的 PowerShell 脚本移植成 Node 版的，附带用假后端运行的自动测试；权限规则、命令运行目录和写入审计都用真 `agy` 跑过。代码按跨平台写，但 macOS 和 Linux 还没有实际跑过，欢迎反馈和修正。
 
-暂时没有的：用别家命令行工具做审稿的角色、联网调研的角色、按单统计费用。
+范围是有意收窄的：只做 Claude Code 加 Antigravity CLI，不打算接别家命令行工具当角色。暂时没有的：实测对比数据、按单统计费用。
 
 ## 开发
 
@@ -159,7 +204,10 @@ claude plugin validate ./brain-dispatch
 ## 相关工作
 
 - Anthropic：[How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system)。编排者加执行者的模式，以及一份好的任务书该有什么。
-- [keli-wen/agy-staff](https://github.com/keli-wen/agy-staff)、[yuting0624/antigravity-for-claude-code](https://github.com/yuting0624/antigravity-for-claude-code)：把 `agy` 接到 Claude Code 后面的另外两种做法。
+- [keli-wen/agy-staff](https://github.com/keli-wen/agy-staff)：让 `agy` 给五种宿主（Claude Code、Codex 等）当帮手，有后台任务、调研／评审／实现几种角色，还有公开的基准测试。
+- [yuting0624/antigravity-for-claude-code](https://github.com/yuting0624/antigravity-for-claude-code)：有委派命令和用测试验收的整包交接、花费度量工具、迁移工具，文档里把 `agy` 出过的毛病写得很坦白。
+
+这两个项目都更大，功能也更多。Brain Dispatch 是小的那个，专注三件事：每一单一份权限配置、从不跳过权限检查；文件审计不依赖 git；没有 `agy` 时，靠 Claude 自家的角色照样能干活。
 
 ## 许可证
 

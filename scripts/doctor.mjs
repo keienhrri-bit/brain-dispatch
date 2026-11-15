@@ -4,7 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  BackendUnavailableError,
   DEFAULT_CONFIG,
+  computeRoles,
   findBackend,
   getStateHome,
   limitText,
@@ -156,6 +158,7 @@ async function main() {
   // 3. Backend lookup and --version
   let backend = null;
   let childEnv = process.env;
+  let backendCheck;
   try {
     backend = findBackend(config, process.env, platform);
     const proxyUrl = await resolveBackendProxy({
@@ -176,37 +179,39 @@ async function main() {
           .split(/\r?\n/)
           .map((l) => l.trim())
           .find(Boolean) || 'ok';
-      checks.push({
+      backendCheck = {
         name: 'backend',
         status: 'OK',
         detail: `${backend.command} (${firstLine})`,
-      });
+      };
     } else {
       const cmdLabel = backend.command;
       backend = null;
-      checks.push({
+      backendCheck = {
         name: 'backend',
         status: 'FAIL',
         detail: `${cmdLabel} --version exited ${ver.code}: ${limitText(ver.stderr || ver.stdout, 120)}`,
-      });
+      };
     }
   } catch (err) {
     backend = null;
-    checks.push({
+    backendCheck = {
       name: 'backend',
-      status: 'FAIL',
+      status: err instanceof BackendUnavailableError ? 'WARN' : 'FAIL',
       detail: err.message,
-    });
+    };
   }
+  checks.push(backendCheck);
 
   // 4. Configured model in backend models output
   const configuredModel = `${config.worker.model}-${config.worker.effort}`;
+  let modelCheck;
   if (!backend) {
-    checks.push({
+    modelCheck = {
       name: 'model',
       status: 'WARN',
       detail: `Skipped model check for ${configuredModel} (backend unavailable)`,
-    });
+    };
   } else {
     const modelsRes = await runCommand(
       backend.command,
@@ -214,28 +219,34 @@ async function main() {
       childEnv
     );
     if (modelsRes.code !== 0) {
-      checks.push({
+      modelCheck = {
         name: 'model',
         status: 'WARN',
         detail: `Backend 'models' exited ${modelsRes.code}; could not verify ${configuredModel}`,
-      });
+      };
     } else if (modelsRes.stdout.includes(configuredModel)) {
-      checks.push({
+      modelCheck = {
         name: 'model',
         status: 'OK',
         detail: `Model ${configuredModel} found in backend models output`,
-      });
+      };
     } else {
-      checks.push({
+      modelCheck = {
         name: 'model',
         status: 'WARN',
         detail: `Configured model "${configuredModel}" not found in backend models output`,
-      });
+      };
     }
   }
+  checks.push(modelCheck);
 
   const hasFail = checks.some((c) => c.status === 'FAIL');
   const exitCode = hasFail ? 1 : 0;
+  const roleSummary = computeRoles({
+    backendStatus: backendCheck.status,
+    modelStatus: modelCheck.status,
+    configuredModel,
+  });
 
   if (opts.json) {
     const payload = {
@@ -244,12 +255,28 @@ async function main() {
       configPath,
       configuredModel,
       checks,
+      roles: {
+        worker: roleSummary.worker,
+      },
+      next: roleSummary.next,
     };
     process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
   } else {
     for (const check of checks) {
       process.stdout.write(`${check.status.padEnd(5)} ${check.name}: ${check.detail}\n`);
     }
+    const roleRows = [
+      ['brain', 'main session (the model you chose with /model)'],
+      ['worker', `Gemini on agy: ${roleSummary.worker.detail}`],
+      ['backup-worker', 'Sonnet subagent, always available'],
+      ['writer', 'Sonnet subagent, always available'],
+      ['finder', 'Haiku subagent, always available'],
+    ];
+    process.stdout.write('\nRoles on this machine:\n');
+    for (const [role, desc] of roleRows) {
+      process.stdout.write(`  ${role.padEnd(14)} ${desc}\n`);
+    }
+    process.stdout.write(`Next: ${roleSummary.next}\n`);
   }
 
   process.exit(exitCode);

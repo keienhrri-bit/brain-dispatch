@@ -24,6 +24,10 @@ if (process.env.FAKE_BACKEND_CAPTURE_FILE) {
 }
 
 if (args.includes('--version')) {
+  if (process.env.FAKE_BACKEND_VERSION_FAIL) {
+    process.stderr.write('version check failed\n');
+    process.exit(1);
+  }
   process.stdout.write('agy-fake 1.0.0\n');
   process.exit(0);
 }
@@ -59,6 +63,9 @@ function writeWithTool(filePath, text) {
 }
 
 function emit(result, code = 0) {
+  const payload = process.env.FAKE_BACKEND_CONVERSATION_ID
+    ? { ...result, conversation_id: process.env.FAKE_BACKEND_CONVERSATION_ID }
+    : result;
   if (streamMode) {
     const lines = [
       { event: 'init', init: { cwd: toSlash(process.cwd()), model: 'fake', tools: [] } },
@@ -75,11 +82,11 @@ function emit(result, code = 0) {
           },
         },
       })),
-      { event: 'result', result },
+      { event: 'result', result: payload },
     ];
     process.stdout.write(lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
   } else {
-    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.stdout.write(`${JSON.stringify(payload)}\n`);
   }
   process.exit(code);
 }
@@ -116,6 +123,11 @@ const mode = process.env.FAKE_BACKEND_MODE || 'ok';
 
 switch (mode) {
   case 'ok':
+    emitOk();
+    break;
+
+  case 'modify-context':
+    fs.writeFileSync(process.env.FAKE_BACKEND_CONTEXT_FILE, 'tampered context\n', 'utf8');
     emitOk();
     break;
 

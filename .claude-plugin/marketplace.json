@@ -8,7 +8,7 @@
     {
       "name": "brain-dispatch",
       "source": "./",
-      "description": "Main session plans and reviews; a Gemini worker on the Antigravity CLI does the legwork, Sonnet writes long drafts, Haiku looks things up."
+      "description": "Main session plans and reviews; a Gemini worker on the Antigravity CLI does the bulk legwork, with Sonnet and Haiku subagents as the Claude-only fallback."
     }
   ]
 }

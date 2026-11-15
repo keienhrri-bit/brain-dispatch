@@ -1,8 +1,8 @@
 {
   "name": "brain-dispatch",
   "displayName": "Brain Dispatch",
-  "version": "0.2.0",
-  "description": "Keep your main Claude session as the brain. Hand legwork to a Gemini worker on the Antigravity CLI, long drafts to Sonnet and file lookups to Haiku, with enforced permissions and measured file changes.",
+  "version": "0.3.0",
+  "description": "Keep your main Claude session as the brain. Hand bulk legwork to a Gemini worker on the Antigravity CLI, or to Sonnet and Haiku subagents when it is not there, with enforced permissions, measured file changes and one shared context file.",
   "author": {
     "name": "keienhrri-bit",
     "url": "https://github.com/keienhrri-bit"
@@ -10,5 +10,5 @@
   "homepage": "https://github.com/keienhrri-bit/brain-dispatch",
   "repository": "https://github.com/keienhrri-bit/brain-dispatch",
   "license": "MIT",
-  "keywords": ["orchestration", "delegation", "multi-agent", "antigravity", "gemini", "subagents"]
+  "keywords": ["orchestration", "delegation", "multi-agent", "antigravity", "antigravity-cli", "gemini", "subagents", "cost-optimization"]
 }

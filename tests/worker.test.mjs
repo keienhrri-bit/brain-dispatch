@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
-import { PROMPT_INLINE_LIMIT, getRepoRoot, toSlash } from '../scripts/lib/core.mjs';
+import { CONTEXT_LIMIT, FALLBACK_HINT, PROMPT_INLINE_LIMIT, getRepoRoot, toSlash } from '../scripts/lib/core.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -130,6 +130,8 @@ test('worker mode ok returns 0, lists + file, and writes job artifacts and ledge
     assert.deepEqual(meta.written_outside, []);
     assert.equal(meta.written_by_tools.length, 1);
     assert.equal(meta.command_dir, toSlash(workDir));
+    assert.equal(meta.context_file, null);
+    assert.equal(meta.context_changed, false);
 
     const ledgerLines = fs.readFileSync(path.join(stateHome, 'ledger.jsonl'), 'utf8').trim().split('\n');
     assert.equal(ledgerLines.length, 1);
@@ -185,6 +187,7 @@ test('worker mode auth returns exit 5', async () => {
     );
     assert.equal(res.code, 5);
     assert.ok(res.stdout.includes('REJECTED:'));
+    assert.ok(res.stdout.includes(FALLBACK_HINT));
   });
 });
 
@@ -197,6 +200,7 @@ test('worker mode quota returns exit 5', async () => {
     );
     assert.equal(res.code, 5);
     assert.ok(res.stdout.includes('REJECTED: Worker quota exhausted'));
+    assert.ok(res.stdout.includes(FALLBACK_HINT));
   });
 });
 
@@ -267,6 +271,7 @@ test('worker returns exit 5 when backend is missing', async () => {
     );
     assert.equal(res.code, 5);
     assert.ok(res.stderr.includes('Antigravity CLI (agy) not found'));
+    assert.ok(res.stderr.includes(FALLBACK_HINT));
   });
 });
 
@@ -312,8 +317,9 @@ test('doctor passes with fake backend, supports --init and --json, and flags mis
         BRAIN_DISPATCH_HOME: stateHome,
       }
     );
-    assert.equal(noBackend.code, 1);
-    assert.ok(noBackend.stdout.includes('FAIL'));
+    assert.equal(noBackend.code, 0);
+    assert.ok(noBackend.stdout.includes('WARN  backend:'));
+    assert.ok(noBackend.stdout.includes('backup-worker (Sonnet) takes its jobs'));
   });
 });
 
@@ -412,5 +418,367 @@ test('worker forwards config.proxy to child process and honors --model override'
     assert.equal(captured.proxy.ALL_PROXY, 'http://127.0.0.1:7890');
     const modelIdx = captured.argv.indexOf('--model');
     assert.equal(captured.argv[modelIdx + 1], 'explicit-model-id');
+  });
+});
+
+test('worker --context prepends shared context to prompt.md, updates meta, and prints Context in dry-run', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    const contextFile = path.join(root, 'shared.md');
+    fs.writeFileSync(contextFile, '  Settled background fact.  \n', 'utf8');
+
+    const dryRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'dryctx', '--task', taskFile, '--workdir', workDir, '--context', contextFile, '--dry-run'],
+      makeEnv(stateHome)
+    );
+    assert.equal(dryRes.code, 0, dryRes.stderr);
+    const dryLines = dryRes.stdout.split(/\r?\n/);
+    const ctxIdx = dryLines.findIndex((l) => l.startsWith('Context: '));
+    const promptIdx = dryLines.findIndex((l) => l.startsWith('Prompt: '));
+    assert.ok(ctxIdx >= 0 && promptIdx === ctxIdx + 1);
+    // Length is counted after trimming, as the worker sees it.
+    assert.equal(dryLines[ctxIdx], `Context: ${contextFile} (24 chars)`);
+    // The context file sits in a deny rule of its own.
+    assert.ok(dryRes.stdout.includes(`"write_file(${toSlash(contextFile)})"`));
+
+    const runRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'runctx', '--task', taskFile, '--workdir', workDir, '--context', contextFile],
+      makeEnv(stateHome, { FAKE_BACKEND_MODE: 'ok' })
+    );
+    assert.equal(runRes.code, 0, runRes.stderr);
+
+    const jobFolders = fs
+      .readdirSync(path.join(stateHome, 'jobs'))
+      .filter((name) => name.endsWith('_runctx'));
+    assert.equal(jobFolders.length, 1);
+    const jobDir = path.join(stateHome, 'jobs', jobFolders[0]);
+    const promptText = fs.readFileSync(path.join(jobDir, 'prompt.md'), 'utf8');
+    assert.ok(promptText.includes('# Shared context'));
+    assert.ok(promptText.includes(`(source: \`${toSlash(contextFile)}\`)`));
+    assert.ok(promptText.includes('\nSettled background fact.\n\n---'));
+
+    const meta = JSON.parse(fs.readFileSync(path.join(jobDir, 'meta.json'), 'utf8'));
+    assert.equal(meta.context_file, contextFile);
+    assert.equal(meta.context_changed, false);
+  });
+});
+
+test('worker --context rejects missing, non-file, empty, and over-limit files with exit code 2', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    const missingCtx = path.join(root, 'missing.md');
+    const missingRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'ctxmiss', '--task', taskFile, '--workdir', workDir, '--context', missingCtx],
+      makeEnv(stateHome)
+    );
+    assert.equal(missingRes.code, 2);
+    assert.ok(missingRes.stderr.includes(`Context file not found: ${missingCtx}`));
+
+    const dirCtx = path.join(root, 'ctx-dir');
+    fs.mkdirSync(dirCtx, { recursive: true });
+    const dirRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'ctxdir', '--task', taskFile, '--workdir', workDir, '--context', dirCtx],
+      makeEnv(stateHome)
+    );
+    assert.equal(dirRes.code, 2);
+    assert.ok(dirRes.stderr.includes(`Context file not found: ${dirCtx}`));
+
+    const emptyCtx = path.join(root, 'empty.md');
+    fs.writeFileSync(emptyCtx, '\uFEFF  \r\n\t ', 'utf8');
+    const emptyRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'ctxempty', '--task', taskFile, '--workdir', workDir, '--context', emptyCtx],
+      makeEnv(stateHome)
+    );
+    assert.equal(emptyRes.code, 2);
+    assert.ok(emptyRes.stderr.includes(`Context file is empty: ${emptyCtx}`));
+
+    const bigCtx = path.join(root, 'big.md');
+    fs.writeFileSync(bigCtx, 'X'.repeat(CONTEXT_LIMIT + 1), 'utf8');
+    const bigRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'ctxbig', '--task', taskFile, '--workdir', workDir, '--context', bigCtx],
+      makeEnv(stateHome)
+    );
+    assert.equal(bigRes.code, 2);
+    assert.ok(
+      bigRes.stderr.includes(
+        `Context file is ${CONTEXT_LIMIT + 1} characters; the limit is 8000. Trim it to what every job needs.`
+      )
+    );
+
+    // Surrounding whitespace does not count toward the limit.
+    const edgeCtx = path.join(root, 'edge.md');
+    fs.writeFileSync(edgeCtx, `\n${'X'.repeat(CONTEXT_LIMIT)}\n\n`, 'utf8');
+    const edgeRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'ctxedge', '--task', taskFile, '--workdir', workDir, '--context', edgeCtx, '--dry-run'],
+      makeEnv(stateHome)
+    );
+    assert.equal(edgeRes.code, 0, edgeRes.stderr);
+  });
+});
+
+test('worker detects modified shared context file during run as exit 3', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    const contextFile = path.join(root, 'shared.md');
+    fs.writeFileSync(contextFile, 'Original shared context.\n', 'utf8');
+
+    const res = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'ctxtamper', '--task', taskFile, '--workdir', workDir, '--context', contextFile],
+      makeEnv(stateHome, {
+        FAKE_BACKEND_MODE: 'modify-context',
+        FAKE_BACKEND_CONTEXT_FILE: contextFile,
+      })
+    );
+    assert.equal(res.code, 3);
+    assert.ok(res.stdout.includes('REJECTED: Shared context file was modified during the run'));
+    assert.ok(res.stdout.includes(`!! shared context modified: ${contextFile}`));
+
+    const jobFolders = fs.readdirSync(path.join(stateHome, 'jobs'));
+    assert.equal(jobFolders.length, 1);
+    const meta = JSON.parse(fs.readFileSync(path.join(stateHome, 'jobs', jobFolders[0], 'meta.json'), 'utf8'));
+    assert.equal(meta.context_file, contextFile);
+    assert.equal(meta.context_changed, true);
+  });
+});
+
+test('worker --follow-up continues by job name and job directory with inherited settings and prompt', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    const extraDir = path.join(root, 'extra');
+    const protectDir = path.join(root, 'protected');
+    const contextFile = path.join(root, 'shared.md');
+    fs.writeFileSync(contextFile, 'Settled follow-up context.\n', 'utf8');
+    const followTaskFile = path.join(root, 'followup-task.md');
+    fs.writeFileSync(followTaskFile, 'Do the second step only.\n', 'utf8');
+
+    const firstRes = await runNode(
+      WORKER_SCRIPT,
+      [
+        '--name',
+        'stepone',
+        '--task',
+        taskFile,
+        '--workdir',
+        workDir,
+        '--write-dir',
+        extraDir,
+        '--protect',
+        protectDir,
+        '--context',
+        contextFile,
+      ],
+      makeEnv(stateHome, {
+        FAKE_BACKEND_MODE: 'ok',
+        FAKE_BACKEND_CONVERSATION_ID: 'conv-fixed-1',
+      })
+    );
+    assert.equal(firstRes.code, 0, firstRes.stderr);
+
+    const jobsRoot = path.join(stateHome, 'jobs');
+    const stepOneFolder = fs.readdirSync(jobsRoot).find((n) => n.endsWith('_stepone'));
+    assert.ok(stepOneFolder);
+    const stepOneDir = path.join(jobsRoot, stepOneFolder);
+    const stepOneMeta = JSON.parse(fs.readFileSync(path.join(stepOneDir, 'meta.json'), 'utf8'));
+    const stepOneSettings = JSON.parse(fs.readFileSync(path.join(stepOneDir, 'settings.json'), 'utf8'));
+    assert.equal(stepOneMeta.follow_up_of, null);
+    assert.deepEqual(stepOneMeta.protect, [path.normalize(protectDir)]);
+
+    const captureByName = path.join(root, 'capture-name.json');
+    const byNameRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'steptwo', '--follow-up', 'stepone', '--task', followTaskFile],
+      makeEnv(stateHome, {
+        FAKE_BACKEND_MODE: 'ok',
+        FAKE_BACKEND_CONVERSATION_ID: 'conv-fixed-1',
+        FAKE_BACKEND_CAPTURE_FILE: captureByName,
+      })
+    );
+    assert.equal(byNameRes.code, 0, byNameRes.stderr);
+
+    const capturedName = JSON.parse(fs.readFileSync(captureByName, 'utf8'));
+    const convIdx = capturedName.argv.indexOf('--conversation');
+    assert.ok(convIdx >= 0);
+    assert.equal(capturedName.argv[convIdx + 1], 'conv-fixed-1');
+
+    const stepTwoFolder = fs.readdirSync(jobsRoot).find((n) => n.endsWith('_steptwo'));
+    assert.ok(stepTwoFolder);
+    const stepTwoDir = path.join(jobsRoot, stepTwoFolder);
+    const stepTwoPrompt = fs.readFileSync(path.join(stepTwoDir, 'prompt.md'), 'utf8');
+    assert.ok(stepTwoPrompt.startsWith('# Follow-up'));
+    assert.ok(stepTwoPrompt.includes('Do the second step only.'));
+    assert.ok(stepTwoPrompt.includes('# Shared context'));
+    assert.ok(!stepTwoPrompt.includes('# Protocol for this job (prepended to the brief by the dispatcher)'));
+
+    const stepTwoMeta = JSON.parse(fs.readFileSync(path.join(stepTwoDir, 'meta.json'), 'utf8'));
+    const stepTwoSettings = JSON.parse(fs.readFileSync(path.join(stepTwoDir, 'settings.json'), 'utf8'));
+    assert.equal(stepTwoMeta.follow_up_of, path.normalize(stepOneDir));
+    assert.equal(stepTwoMeta.work_dir, stepOneMeta.work_dir);
+    assert.deepEqual(stepTwoMeta.write_dir, stepOneMeta.write_dir);
+    assert.equal(stepTwoMeta.access, stepOneMeta.access);
+    assert.equal(stepTwoMeta.context_file, stepOneMeta.context_file);
+    assert.deepEqual(stepTwoMeta.protect, stepOneMeta.protect);
+    assert.deepEqual(stepTwoSettings, stepOneSettings);
+
+    // Follow-up by explicit job directory path also succeeds.
+    const captureByDir = path.join(root, 'capture-dir.json');
+    const byDirRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'stepthree', '--follow-up', stepOneDir, '--task', followTaskFile],
+      makeEnv(stateHome, {
+        FAKE_BACKEND_MODE: 'ok',
+        FAKE_BACKEND_CONVERSATION_ID: 'conv-fixed-1',
+        FAKE_BACKEND_CAPTURE_FILE: captureByDir,
+      })
+    );
+    assert.equal(byDirRes.code, 0, byDirRes.stderr);
+    const capturedDir = JSON.parse(fs.readFileSync(captureByDir, 'utf8'));
+    const dirConvIdx = capturedDir.argv.indexOf('--conversation');
+    assert.ok(dirConvIdx >= 0);
+    assert.equal(capturedDir.argv[dirConvIdx + 1], 'conv-fixed-1');
+  });
+});
+
+test('worker --follow-up rejects conversation id mismatch with exit 3 and handles error cases with exit 2', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    const firstRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'seed', '--task', taskFile, '--workdir', workDir],
+      makeEnv(stateHome, {
+        FAKE_BACKEND_MODE: 'ok',
+        FAKE_BACKEND_CONVERSATION_ID: 'conv-seed',
+      })
+    );
+    assert.equal(firstRes.code, 0, firstRes.stderr);
+
+    const mismatchRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'badconv', '--follow-up', 'seed', '--task', taskFile],
+      makeEnv(stateHome, {
+        FAKE_BACKEND_MODE: 'ok',
+        FAKE_BACKEND_CONVERSATION_ID: 'conv-new-unexpected',
+      })
+    );
+    assert.equal(mismatchRes.code, 3);
+    assert.ok(
+      mismatchRes.stdout.includes(
+        'Follow-up did not resume the earlier conversation (the backend started a new one, without the protocol); dispatch a fresh job'
+      )
+    );
+
+    const missingRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'miss', '--follow-up', 'nonexistent', '--task', taskFile],
+      makeEnv(stateHome)
+    );
+    assert.equal(missingRes.code, 2);
+    assert.ok(missingRes.stderr.includes('No earlier job found for "nonexistent"'));
+
+    const noConvDir = path.join(stateHome, 'jobs', '20261115-000000_noconv');
+    fs.mkdirSync(noConvDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(noConvDir, 'meta.json'),
+      JSON.stringify({ work_dir: workDir, access: 'write' }),
+      'utf8'
+    );
+    const noConvRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'retry', '--follow-up', 'noconv', '--task', taskFile],
+      makeEnv(stateHome)
+    );
+    assert.equal(noConvRes.code, 2);
+    assert.ok(
+      noConvRes.stderr.includes('Job "noconv" has no conversation to continue; dispatch a fresh job instead')
+    );
+
+    const extraFlagRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'conflict', '--follow-up', 'seed', '--task', taskFile, '--workdir', workDir],
+      makeEnv(stateHome)
+    );
+    assert.equal(extraFlagRes.code, 2);
+    assert.ok(
+      extraFlagRes.stderr.includes(
+        '--follow-up takes its directories, access level, model and context file from the earlier job; remove --workdir'
+      )
+    );
+
+    // Dry-run prints Follow-up of line right after Job dir and skips backend.
+    const dryCapture = path.join(root, 'dry-capture.json');
+    const seedDir = path.join(
+      stateHome,
+      'jobs',
+      fs.readdirSync(path.join(stateHome, 'jobs')).find((n) => n.endsWith('_seed'))
+    );
+    const dryRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'dryfu', '--follow-up', 'seed', '--task', taskFile, '--dry-run'],
+      makeEnv(stateHome, { FAKE_BACKEND_CAPTURE_FILE: dryCapture })
+    );
+    assert.equal(dryRes.code, 0, dryRes.stderr);
+    assert.equal(fs.existsSync(dryCapture), false);
+    const dryLines = dryRes.stdout.split(/\r?\n/);
+    const jobDirIdx = dryLines.findIndex((l) => l.startsWith('Job dir: '));
+    assert.ok(jobDirIdx >= 0);
+    assert.equal(
+      dryLines[jobDirIdx + 1],
+      `Follow-up of: ${path.normalize(seedDir)} (conversation conv-seed)`
+    );
+  });
+});
+
+test('worker --follow-up drops deleted context file silently and rejects missing workdir', async () => {
+  await withTempWorkspace(async ({ root, stateHome, workDir, taskFile }) => {
+    const contextFile = path.join(root, 'ephemeral.md');
+    fs.writeFileSync(contextFile, 'Temporary context.\n', 'utf8');
+
+    const firstRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'withctx', '--task', taskFile, '--workdir', workDir, '--context', contextFile],
+      makeEnv(stateHome, {
+        FAKE_BACKEND_MODE: 'ok',
+        FAKE_BACKEND_CONVERSATION_ID: 'conv-ctx-1',
+      })
+    );
+    assert.equal(firstRes.code, 0, firstRes.stderr);
+
+    fs.rmSync(contextFile);
+    const noCtxFollow = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'afterdelctx', '--follow-up', 'withctx', '--task', taskFile],
+      makeEnv(stateHome, {
+        FAKE_BACKEND_MODE: 'ok',
+        FAKE_BACKEND_CONVERSATION_ID: 'conv-ctx-1',
+      })
+    );
+    assert.equal(noCtxFollow.code, 0, noCtxFollow.stderr);
+    const followFolder = fs
+      .readdirSync(path.join(stateHome, 'jobs'))
+      .find((n) => n.endsWith('_afterdelctx'));
+    const followPrompt = fs.readFileSync(
+      path.join(stateHome, 'jobs', followFolder, 'prompt.md'),
+      'utf8'
+    );
+    const followMeta = JSON.parse(
+      fs.readFileSync(path.join(stateHome, 'jobs', followFolder, 'meta.json'), 'utf8')
+    );
+    assert.ok(!followPrompt.includes('# Shared context'));
+    assert.equal(followMeta.context_file, null);
+
+    fs.rmSync(workDir, { recursive: true, force: true });
+    const missingWorkRes = await runNode(
+      WORKER_SCRIPT,
+      ['--name', 'nowork', '--follow-up', 'withctx', '--task', taskFile],
+      makeEnv(stateHome)
+    );
+    assert.equal(missingWorkRes.code, 2);
+    assert.ok(
+      missingWorkRes.stderr.includes(
+        `Working directory of the earlier job no longer exists: ${path.normalize(workDir)}`
+      )
+    );
   });
 });

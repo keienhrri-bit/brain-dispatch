@@ -22,7 +22,7 @@ Rules for writing files:
 
 1. The write tool takes absolute paths. Copy the directory path from the list above **character for character**, then append the file name. Do not retype long paths from memory; one wrong character sends the file somewhere else.
 2. After writing a file, read it back at the same path once to confirm it exists and is complete.
-3. A write outside the writable directories aborts the whole job and your report is lost. If the brief needs a file changed somewhere else, do not touch it; put it in `open`.
+3. A write outside the writable directories is detected after the run, and the whole job is rejected whatever else you delivered. If the brief needs a file changed somewhere else, do not touch it; put it in `open`.
 4. Never delete files. Do not overwrite an existing file unless the brief names it as one to change.
 
 ## How to work
@@ -50,6 +50,7 @@ When everything is done, output exactly one JSON object with the fields below an
 | `unverified` | What you did not check and why |
 | `open` | Decisions for the brain or the user, and problems you noticed but did not touch. Empty array if none |
 
+{{CONTEXT}}
 ---
 
 # Brief

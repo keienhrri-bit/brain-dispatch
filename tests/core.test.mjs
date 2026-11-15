@@ -6,12 +6,15 @@ import path from 'node:path';
 import { test } from 'node:test';
 import {
   CMD_DENY_PATTERNS,
+  CONTEXT_LIMIT,
   DEFAULT_CONFIG,
+  FALLBACK_HINT,
   PROMPT_INLINE_LIMIT,
   ValidationError,
   buildBackendArgs,
   buildSettings,
   commandDenyBodies,
+  computeRoles,
   diffReadOnly,
   diffSnapshots,
   findBackend,
@@ -26,6 +29,7 @@ import {
   parseWorkerArgs,
   reconcileReport,
   renderPrompt,
+  resolveFollowUp,
   selectPromptArg,
   takeSnapshot,
   toSlash,
@@ -711,5 +715,492 @@ test('resolveBackendProxy handles config proxy, inherited proxy, and registry pr
     assert.equal(applied.ALL_PROXY, `http://127.0.0.1:${port}`);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('parseWorkerArgs parses optional --context and rejects empty value', () => {
+  const cfg = mergeConfig({});
+  const withoutCtx = parseWorkerArgs(['--name', 'a', '--task', 't.md', '--workdir', 'w'], cfg);
+  assert.equal(withoutCtx.context, null);
+
+  const withCtx = parseWorkerArgs(
+    ['--name', 'a', '--task', 't.md', '--workdir', 'w', '--context', 'shared.md'],
+    cfg
+  );
+  assert.equal(withCtx.context, 'shared.md');
+
+  const withEqCtx = parseWorkerArgs(
+    ['--name', 'a', '--task', 't.md', '--workdir', 'w', '--context=ctx.md'],
+    cfg
+  );
+  assert.equal(withEqCtx.context, 'ctx.md');
+
+  assert.throws(
+    () => parseWorkerArgs(['--name', 'a', '--task', 't.md', '--workdir', 'w', '--context', '   '], cfg),
+    ValidationError
+  );
+});
+
+test('renderPrompt handles shared context with, without, and missing placeholder', () => {
+  const tplPath = path.join(getRepoRoot(), 'templates', 'worker-protocol.md');
+  const template = fs.readFileSync(tplPath, 'utf8');
+
+  const withContext = renderPrompt({
+    template,
+    taskText: 'Do task.',
+    workDir: 'C:\\work',
+    writable: ['C:\\work'],
+    readDirs: [],
+    access: 'write',
+    web: false,
+    contextText: '\n  Shared fact 1.\n  Shared fact 2.  \n',
+    contextFile: 'C:\\proj\\shared.md',
+  });
+  assert.ok(!withContext.includes('{{CONTEXT}}'));
+  assert.ok(withContext.includes('# Shared context\n\nBackground the brain gives to every job in this piece of work (source: `C:/proj/shared.md`). Treat it as settled. You cannot change this file: if something in it looks wrong or out of date, say so in `open`.\n\nShared fact 1.\n  Shared fact 2.\n\n---'));
+  assert.ok(withContext.endsWith('Do task.'));
+
+  const withoutContext = renderPrompt({
+    template,
+    taskText: 'Do task.',
+    workDir: 'C:\\work',
+    writable: ['C:\\work'],
+    readDirs: [],
+    access: 'write',
+    web: false,
+  });
+  assert.ok(!withoutContext.includes('{{CONTEXT}}'));
+  assert.ok(!withoutContext.includes('# Shared context'));
+  assert.ok(withoutContext.endsWith('Do task.'));
+
+  const legacyTemplate = 'Workdir: {{WORKDIR}}\n---\n# Brief\n';
+  const legacyRendered = renderPrompt({
+    template: legacyTemplate,
+    taskText: 'Legacy task.',
+    workDir: '/tmp/w',
+    writable: ['/tmp/w'],
+    readDirs: [],
+    access: 'write',
+    web: false,
+    contextText: 'Ignored without placeholder',
+    contextFile: '/tmp/ctx.md',
+  });
+  assert.equal(legacyRendered, 'Workdir: /tmp/w\n---\n# Brief\nLegacy task.');
+});
+
+test('judgeRun and formatReport handle contextChanged and respect precedence', () => {
+  const validParsed = parseBackendOutput(
+    JSON.stringify({
+      status: 'SUCCESS',
+      usage: { total_tokens: 10 },
+      structured_output: {
+        status: 'done',
+        summary: 'done',
+        files: [],
+        findings: [],
+        verified: [],
+        unverified: [],
+        open: [],
+      },
+    })
+  );
+
+  const ctxModified = judgeRun({
+    timedOut: false,
+    timeoutMin: 5,
+    code: 0,
+    stderr: '',
+    stdout: '',
+    parsed: validParsed,
+    contextChanged: true,
+    outside: ['/outside/a.txt'],
+  });
+  assert.equal(ctxModified.exit, 3);
+  assert.equal(ctxModified.reason, 'Shared context file was modified during the run');
+
+  const roBeatsCtx = judgeRun({
+    timedOut: false,
+    timeoutMin: 5,
+    code: 0,
+    stderr: '',
+    stdout: '',
+    parsed: validParsed,
+    roTouched: ['/ro/file.txt'],
+    contextChanged: true,
+  });
+  assert.equal(roBeatsCtx.exit, 3);
+  assert.match(roBeatsCtx.reason, /^Read-only directory modified:/);
+
+  const formatted = formatReport({
+    name: 'ctxjob',
+    model: 'gemini-4-hydrogen-high',
+    access: 'write',
+    secs: 1,
+    reason: ctxModified.reason,
+    parsed: validParsed,
+    created: [],
+    modified: [],
+    deleted: [],
+    missing: [],
+    unreported: [],
+    roTouched: [],
+    contextChanged: true,
+    contextFile: '/tmp/shared.md',
+    claimed: new Map(),
+  });
+  assert.ok(!formatted.reportText.includes('Files (measured by the dispatcher): no changes'));
+  assert.ok(formatted.reportText.includes('  !! shared context modified: /tmp/shared.md'));
+  assert.equal(CONTEXT_LIMIT, 8000);
+  assert.ok(FALLBACK_HINT.startsWith('Fallback: hand the same brief'));
+});
+
+test('computeRoles returns ready, check-model, and unavailable states', () => {
+  assert.deepEqual(
+    computeRoles({
+      backendStatus: 'WARN',
+      modelStatus: 'WARN',
+      configuredModel: 'gemini-4-hydrogen-high',
+    }),
+    {
+      worker: {
+        status: 'unavailable',
+        detail: 'not available; backup-worker (Sonnet) takes its jobs',
+      },
+      next: 'install the Antigravity CLI (see /brain-dispatch:setup), or carry on with the Claude-only roles.',
+    }
+  );
+
+  assert.deepEqual(
+    computeRoles({
+      backendStatus: 'FAIL',
+      modelStatus: 'WARN',
+      configuredModel: 'gemini-4-hydrogen-high',
+    }).worker.status,
+    'unavailable'
+  );
+
+  assert.deepEqual(
+    computeRoles({
+      backendStatus: 'OK',
+      modelStatus: 'WARN',
+      configuredModel: 'gemini-4-hydrogen-high',
+    }),
+    {
+      worker: {
+        status: 'check-model',
+        detail: 'agy found, but gemini-4-hydrogen-high is not in "agy models"',
+      },
+      next: 'pick a model from "agy models" and set worker.model in the config.',
+    }
+  );
+
+  assert.deepEqual(
+    computeRoles({
+      backendStatus: 'OK',
+      modelStatus: 'OK',
+      configuredModel: 'gemini-4-hydrogen-high',
+    }),
+    {
+      worker: {
+        status: 'ready',
+        detail: 'ready (gemini-4-hydrogen-high)',
+      },
+      next: 'run the smoke test in /brain-dispatch:setup to confirm agy is signed in.',
+    }
+  );
+});
+
+test('parseWorkerArgs handles --follow-up, missing --task, and disallowed flags', () => {
+  const cfg = mergeConfig({});
+  const normal = parseWorkerArgs(['--name', 'a', '--task', 't.md', '--workdir', 'w'], cfg);
+  assert.equal(normal.followUp, null);
+
+  const follow = parseWorkerArgs(
+    ['--name', 'step2', '--task', 'next.md', '--follow-up', 'prev', '--timeout-min', '7', '--dry-run'],
+    cfg
+  );
+  assert.equal(follow.followUp, 'prev');
+  assert.equal(follow.name, 'step2');
+  assert.equal(follow.task, 'next.md');
+  assert.equal(follow.timeoutMin, 7);
+  assert.equal(follow.dryRun, true);
+  assert.equal(follow.workdir, null);
+
+  assert.throws(
+    () => parseWorkerArgs(['--name', 'step2', '--follow-up', 'prev'], cfg),
+    (err) => err instanceof ValidationError && err.message === 'Missing required argument: --task'
+  );
+
+  assert.throws(
+    () => parseWorkerArgs(['--name', 'step2', '--task', 'next.md', '--follow-up', '   '], cfg),
+    ValidationError
+  );
+
+  for (const [flag, extra] of [
+    ['--workdir', ['--workdir', 'w']],
+    ['--access', ['--access', 'full']],
+    ['--context', ['--context', 'ctx.md']],
+    ['--write-dir', ['--write-dir', 'out']],
+    ['--read-dir', ['--read-dir', 'ro']],
+    ['--protect', ['--protect', 'prot']],
+    ['--web', ['--web']],
+    ['--model', ['--model', 'custom']],
+    ['--effort', ['--effort', 'low']],
+  ]) {
+    assert.throws(
+      () =>
+        parseWorkerArgs(
+          ['--name', 'step2', '--task', 'next.md', '--follow-up', 'prev', ...extra],
+          cfg
+        ),
+      (err) =>
+        err instanceof ValidationError &&
+        err.message ===
+          `--follow-up takes its directories, access level, model and context file from the earlier job; remove ${flag}`
+    );
+  }
+
+  // Flag appearing before --follow-up is still reported as the first offending flag.
+  assert.throws(
+    () =>
+      parseWorkerArgs(
+        ['--name', 'step2', '--workdir', 'w', '--task', 'next.md', '--follow-up=prev', '--access=read'],
+        cfg
+      ),
+    (err) =>
+      err instanceof ValidationError &&
+      err.message.endsWith('remove --workdir')
+  );
+});
+
+test('buildBackendArgs includes --conversation only when conversationId is given', () => {
+  const withoutConv = buildBackendArgs({
+    promptArg: 'hello',
+    model: 'gemini-4-hydrogen-high',
+    settingsFile: '/tmp/settings.json',
+    schemaFile: '/tmp/schema.json',
+    timeoutMin: 5,
+    access: 'write',
+  });
+  assert.ok(!withoutConv.includes('--conversation'));
+
+  const withConv = buildBackendArgs({
+    promptArg: 'hello',
+    model: 'gemini-4-hydrogen-high',
+    settingsFile: '/tmp/settings.json',
+    schemaFile: '/tmp/schema.json',
+    timeoutMin: 5,
+    access: 'write',
+    conversationId: 'conv-abc',
+  });
+  const convIdx = withConv.indexOf('--conversation');
+  assert.ok(convIdx >= 0);
+  assert.equal(withConv[convIdx + 1], 'conv-abc');
+});
+
+test('judgeRun rejects mismatched conversationId in follow-up mode and ignores matching id', () => {
+  const mkParsed = (extra = {}) =>
+    parseBackendOutput(
+      JSON.stringify({
+        status: 'SUCCESS',
+        conversation_id: 'conv-1',
+        structured_output: {
+          status: 'done',
+          summary: 'ok',
+          files: [],
+          findings: [],
+          verified: [],
+          unverified: [],
+          open: [],
+        },
+        ...extra,
+      })
+    );
+
+  const match = judgeRun({
+    timedOut: false,
+    timeoutMin: 5,
+    code: 0,
+    stderr: '',
+    stdout: '',
+    parsed: mkParsed({ conversation_id: 'conv-1' }),
+    expectedConversationId: 'conv-1',
+  });
+  assert.equal(match.exit, 0);
+
+  const mismatch = judgeRun({
+    timedOut: false,
+    timeoutMin: 5,
+    code: 0,
+    stderr: '',
+    stdout: '',
+    parsed: mkParsed({ conversation_id: 'conv-new' }),
+    expectedConversationId: 'conv-1',
+  });
+  assert.equal(mismatch.exit, 3);
+  assert.equal(
+    mismatch.reason,
+    'Follow-up did not resume the earlier conversation (the backend started a new one, without the protocol); dispatch a fresh job'
+  );
+
+  const missingId = judgeRun({
+    timedOut: false,
+    timeoutMin: 5,
+    code: 0,
+    stderr: '',
+    stdout: '',
+    parsed: mkParsed({ conversation_id: null }),
+    expectedConversationId: 'conv-1',
+  });
+  assert.equal(missingId.exit, 3);
+  assert.equal(missingId.reason, mismatch.reason);
+
+  // Precedence: after rawObj check, before denied check.
+  const noJson = judgeRun({
+    timedOut: false,
+    timeoutMin: 5,
+    code: 1,
+    stderr: 'crash',
+    stdout: '',
+    parsed: parseBackendOutput('not json'),
+    expectedConversationId: 'conv-1',
+  });
+  assert.equal(noJson.exit, 3);
+  assert.match(noJson.reason, /^Backend did not return JSON/);
+
+  const deniedWrongConv = judgeRun({
+    timedOut: false,
+    timeoutMin: 5,
+    code: 1,
+    stderr: '',
+    stdout: '',
+    parsed: parseBackendOutput(
+      JSON.stringify({
+        status: 'DENIED',
+        conversation_id: 'conv-other',
+        denied_actions: [{ action: 'write_file(/x)' }],
+      })
+    ),
+    expectedConversationId: 'conv-1',
+  });
+  assert.equal(deniedWrongConv.exit, 3);
+  assert.equal(deniedWrongConv.reason, mismatch.reason);
+});
+
+test('resolveFollowUp resolves by directory and latest job name, and validates meta.json', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bd-followup-'));
+  try {
+    const stateHome = path.join(tmp, 'state');
+    const jobsDir = path.join(stateHome, 'jobs');
+    const olderDir = path.join(jobsDir, '20261115-090000_alpha');
+    const newerDir = path.join(jobsDir, '20261115-100000_alpha');
+    const minimalDir = path.join(jobsDir, '20261115-110000_minimal');
+    const badJsonDir = path.join(jobsDir, '20261115-120000_badjson');
+    const noConvDir = path.join(jobsDir, '20261115-130000_noconv');
+    const badAccessDir = path.join(jobsDir, '20261115-140000_badacc');
+
+    for (const d of [olderDir, newerDir, minimalDir, badJsonDir, noConvDir, badAccessDir]) {
+      fs.mkdirSync(d, { recursive: true });
+    }
+
+    fs.writeFileSync(
+      path.join(olderDir, 'meta.json'),
+      JSON.stringify({
+        conversation_id: 'conv-old',
+        work_dir: path.join(tmp, 'w-old'),
+        access: 'read',
+      }),
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(newerDir, 'meta.json'),
+      JSON.stringify({
+        conversation_id: 'conv-new',
+        work_dir: path.join(tmp, 'w-new'),
+        write_dir: [path.join(tmp, 'extra')],
+        read_dir: [path.join(tmp, 'ro')],
+        protect: [path.join(tmp, 'prot')],
+        access: 'full',
+        web: 1,
+        model: 'gemini-4-hydrogen-high',
+        context_file: path.join(tmp, 'ctx.md'),
+      }),
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(minimalDir, 'meta.json'),
+      JSON.stringify({
+        conversation_id: 'conv-min',
+        work_dir: path.join(tmp, 'w-min'),
+        access: 'write',
+      }),
+      'utf8'
+    );
+    fs.writeFileSync(path.join(badJsonDir, 'meta.json'), '{not-valid-json', 'utf8');
+    fs.writeFileSync(
+      path.join(noConvDir, 'meta.json'),
+      JSON.stringify({ conversation_id: '', work_dir: path.join(tmp, 'w'), access: 'write' }),
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(badAccessDir, 'meta.json'),
+      JSON.stringify({ conversation_id: 'conv-x', work_dir: path.join(tmp, 'w'), access: 'admin' }),
+      'utf8'
+    );
+
+    // A later job whose name only ends with the same word is a different job.
+    const otherDir = path.join(jobsDir, '20261115-150000_pre_alpha');
+    fs.mkdirSync(otherDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(otherDir, 'meta.json'),
+      JSON.stringify({ conversation_id: 'conv-other', work_dir: tmp, access: 'write' }),
+      'utf8'
+    );
+    assert.equal(
+      resolveFollowUp({ ref: 'pre_alpha', stateHome, platform: process.platform }).conversationId,
+      'conv-other'
+    );
+
+    const byName = resolveFollowUp({ ref: 'alpha', stateHome, platform: process.platform });
+    assert.equal(byName.jobDir, path.normalize(newerDir));
+    assert.equal(byName.conversationId, 'conv-new');
+    assert.equal(byName.workDir, path.join(tmp, 'w-new'));
+    assert.deepEqual(byName.writeDirs, [path.join(tmp, 'extra')]);
+    assert.deepEqual(byName.readDirs, [path.join(tmp, 'ro')]);
+    assert.deepEqual(byName.protect, [path.join(tmp, 'prot')]);
+    assert.equal(byName.access, 'full');
+    assert.equal(byName.web, true);
+    assert.equal(byName.model, 'gemini-4-hydrogen-high');
+    assert.equal(byName.contextFile, path.join(tmp, 'ctx.md'));
+
+    const byDir = resolveFollowUp({ ref: olderDir, stateHome, platform: process.platform });
+    assert.equal(byDir.jobDir, path.normalize(olderDir));
+    assert.equal(byDir.conversationId, 'conv-old');
+
+    const minRes = resolveFollowUp({ ref: 'minimal', stateHome, platform: process.platform });
+    assert.deepEqual(minRes.writeDirs, []);
+    assert.deepEqual(minRes.readDirs, []);
+    assert.deepEqual(minRes.protect, []);
+    assert.equal(minRes.web, false);
+    assert.equal(minRes.contextFile, null);
+
+    assert.throws(
+      () => resolveFollowUp({ ref: 'unknown-job', stateHome, platform: process.platform }),
+      (err) =>
+        err instanceof ValidationError &&
+        err.message ===
+          `No earlier job found for "unknown-job" (looked for a job directory, then for a job of that name under ${path.normalize(jobsDir)})`
+    );
+
+    for (const ref of ['badjson', 'noconv', 'badacc']) {
+      assert.throws(
+        () => resolveFollowUp({ ref, stateHome, platform: process.platform }),
+        (err) =>
+          err instanceof ValidationError &&
+          err.message === `Job "${ref}" has no conversation to continue; dispatch a fresh job instead`
+      );
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

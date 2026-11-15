@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0
+
+The plugin now adapts to the machine it is installed on, and a failed dispatch no longer costs a rewrite.
+
+- **Works without the Antigravity CLI.** New `backup-worker` subagent (Sonnet) takes the same brief file the Gemini worker would get. The session-start note checks whether `agy` is present and describes the roles that actually exist: with `agy`, bulk legwork goes to the Gemini worker; without it, to `backup-worker` and `finder`. The note also tells the main session that built-in subagents inherit its model, so legwork should not go to them.
+- **Exit code 5 names the fallback.** When the backend is missing, signed out or out of quota, the dispatcher prints which subagent takes the same brief.
+- **Shared context file.** `--context <file>` puts one brain-maintained file of settled decisions, conventions and paths in front of every brief, so background is written once per piece of work instead of once per job. The limit is 8,000 characters. The file is read-only for the worker: its file tools are denied writes to it, also when it sits inside a writable directory, and a run during which it changed anyway is rejected with exit code 3 and a `!! shared context modified` line. `templates/context-template.md` is a starting point.
+- **Follow-ups.** `--follow-up <job>` continues an earlier job in the same `agy` conversation, so a result that is incomplete or wrong in one place takes a short note instead of a new brief, and the worker still has what it read. It is meant for fixing or finishing a job, not as a way to spend fewer worker tokens. Directories, access level, model and context file come from the earlier job; the permission rules and the file audit are the same. `agy` starts a new conversation without failing when it cannot find the one it was given, so the dispatcher compares conversation ids and rejects that run with exit code 3. `meta.json` gains `follow_up_of` and `protect`.
+- **`doctor.mjs` prints a role table** (`brain`, `worker`, `backup-worker`, `writer`, `finder`) and the next step. A missing `agy` is now a warning, not a failure, because the Claude-only roles still work. `--json` carries `roles` and `next`.
+- **`setup` skill** explains the two levels (Claude only, Claude plus a Gemini worker) and carries the official Antigravity CLI install commands, to be run only on the user's say-so.
+- **`dispatch` skill**: one table of roles with what each costs the Claude plan, a rule to hand off whole chunks rather than small steps, and a section on shared context and passing results between roles as file paths.
+- The worker protocol no longer claims that a write outside the writable directories aborts the run. It is detected afterwards and the job is rejected, which is what 0.2.0 implemented.
+
 ## 0.2.0
 
 Fixes found by running the dispatcher against `agy` 1.5.9.

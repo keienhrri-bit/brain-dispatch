@@ -18,7 +18,10 @@ export const DEFAULT_CONFIG = Object.freeze({
 export const VALID_ACCESS = Object.freeze(['read', 'write', 'full']);
 export const VALID_EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh']);
 export const PROMPT_INLINE_LIMIT = 12000;
+export const CONTEXT_LIMIT = 8000;
 export const DEFAULT_KILL_GRACE_SEC = 60;
+export const FALLBACK_HINT =
+  'Fallback: hand the same brief to the brain-dispatch:backup-worker subagent (Sonnet), or to brain-dispatch:finder (Haiku) if the job only reads.';
 
 // Command deny rules for `full` access. agy matches each `regex:` rule against the
 // whole command string (Go RE2 syntax: no lookarounds). Patterns are anchored at
@@ -243,6 +246,8 @@ export function parseWorkerArgs(argv, config = mergeConfig({})) {
   const opts = {
     name: null,
     task: null,
+    context: null,
+    followUp: null,
     workdir: null,
     readDirs: [],
     writeDirs: [],
@@ -259,6 +264,8 @@ export function parseWorkerArgs(argv, config = mergeConfig({})) {
   const valueFlags = new Set([
     '--name',
     '--task',
+    '--context',
+    '--follow-up',
     '--workdir',
     '--read-dir',
     '--write-dir',
@@ -269,6 +276,19 @@ export function parseWorkerArgs(argv, config = mergeConfig({})) {
     '--timeout-min',
   ]);
 
+  const disallowedWithFollowUp = new Set([
+    '--workdir',
+    '--write-dir',
+    '--read-dir',
+    '--protect',
+    '--access',
+    '--web',
+    '--model',
+    '--effort',
+    '--context',
+  ]);
+  const followUpConflicts = [];
+
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === '--help' || token === '-h') {
@@ -277,6 +297,7 @@ export function parseWorkerArgs(argv, config = mergeConfig({})) {
     }
     if (token === '--web') {
       opts.web = true;
+      followUpConflicts.push('--web');
       continue;
     }
     if (token === '--dry-run') {
@@ -304,12 +325,22 @@ export function parseWorkerArgs(argv, config = mergeConfig({})) {
       i += 1;
     }
 
+    if (disallowedWithFollowUp.has(flag)) {
+      followUpConflicts.push(flag);
+    }
+
     switch (flag) {
       case '--name':
         opts.name = val;
         break;
       case '--task':
         opts.task = val;
+        break;
+      case '--context':
+        opts.context = val;
+        break;
+      case '--follow-up':
+        opts.followUp = val;
         break;
       case '--workdir':
         opts.workdir = val;
@@ -348,6 +379,19 @@ export function parseWorkerArgs(argv, config = mergeConfig({})) {
   if (!opts.name) throw new ValidationError('Missing required argument: --name');
   validateName(opts.name);
   if (!opts.task) throw new ValidationError('Missing required argument: --task');
+
+  if (opts.followUp !== null) {
+    if (!opts.followUp.trim()) {
+      throw new ValidationError('Invalid --follow-up: value cannot be empty');
+    }
+    if (followUpConflicts.length > 0) {
+      throw new ValidationError(
+        `--follow-up takes its directories, access level, model and context file from the earlier job; remove ${followUpConflicts[0]}`
+      );
+    }
+    return opts;
+  }
+
   if (!opts.workdir) throw new ValidationError('Missing required argument: --workdir');
 
   if (!VALID_ACCESS.includes(opts.access)) {
@@ -363,6 +407,9 @@ export function parseWorkerArgs(argv, config = mergeConfig({})) {
   if (opts.model !== null && !opts.model.trim()) {
     throw new ValidationError('Invalid --model: value cannot be empty');
   }
+  if (opts.context !== null && !opts.context.trim()) {
+    throw new ValidationError('Invalid --context: value cannot be empty');
+  }
 
   opts.readDirs = splitList(opts.readDirs);
   opts.writeDirs = splitList(opts.writeDirs);
@@ -372,6 +419,108 @@ export function parseWorkerArgs(argv, config = mergeConfig({})) {
     : `${config.worker.model}-${opts.effort}`;
 
   return opts;
+}
+
+export function resolveFollowUp({ ref, stateHome, platform = process.platform }) {
+  const rawRef = String(ref ?? '');
+  const trimmedRef = rawRef.trim();
+  const resolvedStateHome = normalizePath(stateHome, platform);
+  const jobsDir = normalizePath(path.join(resolvedStateHome, 'jobs'), platform);
+
+  let jobDir = null;
+  if (trimmedRef) {
+    const candidate = normalizePath(expandHome(rawRef, os.homedir()), platform);
+    // A directory counts as a job directory only when it holds a meta.json, so
+    // a job name that happens to match a folder in the current directory still
+    // resolves by name.
+    try {
+      if (
+        fs.statSync(candidate).isDirectory() &&
+        fs.statSync(path.join(candidate, 'meta.json')).isFile()
+      ) {
+        jobDir = candidate;
+      }
+    } catch {
+      // Not a job directory; fall back to job name lookup under jobsDir.
+    }
+  }
+
+  if (!jobDir && trimmedRef) {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(jobsDir, { withFileTypes: true });
+    } catch {
+      entries = [];
+    }
+    const suffix = `_${rawRef}`;
+    const matches = [];
+    for (const entry of entries) {
+      if (!entry.name.endsWith(suffix)) continue;
+      // The rest must be the time stamp alone, so "fix" does not match a job named "pre_fix".
+      if (!/^\d{8}-\d{6}$/.test(entry.name.slice(0, -suffix.length))) continue;
+      const fullPath = path.join(jobsDir, entry.name);
+      let isDir = entry.isDirectory();
+      if (!isDir && entry.isSymbolicLink()) {
+        try {
+          isDir = fs.statSync(fullPath).isDirectory();
+        } catch {
+          isDir = false;
+        }
+      }
+      if (isDir) {
+        matches.push(entry.name);
+      }
+    }
+    if (matches.length > 0) {
+      matches.sort();
+      jobDir = normalizePath(path.join(jobsDir, matches[matches.length - 1]), platform);
+    }
+  }
+
+  if (!jobDir) {
+    throw new ValidationError(
+      `No earlier job found for "${rawRef}" (looked for a job directory, then for a job of that name under ${jobsDir})`
+    );
+  }
+
+  const metaPath = path.join(jobDir, 'meta.json');
+  const noConvMsg = `Job "${rawRef}" has no conversation to continue; dispatch a fresh job instead`;
+  let meta;
+  try {
+    const raw = stripBom(fs.readFileSync(metaPath, 'utf8'));
+    meta = JSON.parse(raw);
+  } catch {
+    throw new ValidationError(noConvMsg);
+  }
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) {
+    throw new ValidationError(noConvMsg);
+  }
+  if (typeof meta.conversation_id !== 'string' || !meta.conversation_id.trim()) {
+    throw new ValidationError(noConvMsg);
+  }
+  if (typeof meta.work_dir !== 'string' || !meta.work_dir.trim()) {
+    throw new ValidationError(noConvMsg);
+  }
+  if (!VALID_ACCESS.includes(meta.access)) {
+    throw new ValidationError(noConvMsg);
+  }
+
+  const toStringList = (val) =>
+    Array.isArray(val) ? val.filter((item) => typeof item === 'string' && item.trim()) : [];
+
+  return {
+    jobDir,
+    conversationId: meta.conversation_id,
+    workDir: meta.work_dir,
+    writeDirs: toStringList(meta.write_dir),
+    readDirs: toStringList(meta.read_dir),
+    access: meta.access,
+    web: Boolean(meta.web),
+    model: typeof meta.model === 'string' && meta.model.trim() ? meta.model : null,
+    contextFile:
+      typeof meta.context_file === 'string' && meta.context_file.trim() ? meta.context_file : null,
+    protect: toStringList(meta.protect),
+  };
 }
 
 export function getHardProtectedDirs({
@@ -518,7 +667,17 @@ export function buildSettings({ access, web, writeDeny = [], writable = [] }) {
   };
 }
 
-export function renderPrompt({ template, taskText, workDir, writable, readDirs, access, web }) {
+export function renderPrompt({
+  template,
+  taskText,
+  workDir,
+  writable,
+  readDirs,
+  access,
+  web,
+  contextText = null,
+  contextFile = null,
+}) {
   const formatBullets = (list, emptyText) =>
     list.length > 0
       ? list.map((dir) => `  - \`${toSlash(dir)}\``).join('\n')
@@ -536,6 +695,19 @@ export function renderPrompt({ template, taskText, workDir, writable, readDirs, 
     ? 'You may search the web and read URLs. Attach the link to every piece of information taken from the web.'
     : 'No web access. If you need information from the web, put it in `open`.';
 
+  const trimmedContext = typeof contextText === 'string' ? contextText.trim() : '';
+  const sourcePart = contextFile ? ` (source: \`${toSlash(contextFile)}\`)` : '';
+  const contextBlock = trimmedContext
+    ? [
+        '# Shared context',
+        '',
+        `Background the brain gives to every job in this piece of work${sourcePart}. Treat it as settled. You cannot change this file: if something in it looks wrong or out of date, say so in \`open\`.`,
+        '',
+        trimmedContext,
+        '',
+      ].join('\n')
+    : '';
+
   const head = template
     .split('{{WORKDIR}}')
     .join(toSlash(workDir))
@@ -546,7 +718,9 @@ export function renderPrompt({ template, taskText, workDir, writable, readDirs, 
     .split('{{CMD}}')
     .join(cmdTextByAccess[access])
     .split('{{WEB}}')
-    .join(webText);
+    .join(webText)
+    .split('{{CONTEXT}}')
+    .join(contextBlock);
 
   return head + taskText;
 }
@@ -565,6 +739,7 @@ export function buildBackendArgs({
   schemaFile,
   timeoutMin,
   access,
+  conversationId = null,
 }) {
   const timeoutSec = Math.max(1, Math.round(timeoutMin * 60));
   // stream-json carries one event per tool call (with its parameters) before the
@@ -587,6 +762,9 @@ export function buildBackendArgs({
 
   if (access !== 'read') {
     argv.push('--mode', 'accept-edits');
+  }
+  if (conversationId) {
+    argv.push('--conversation', conversationId);
   }
 
   // No --add-dir. agy sorts its workspace directories alphabetically and runs
@@ -1073,8 +1251,10 @@ export function judgeRun({
   parsed,
   missing = [],
   roTouched = [],
+  contextChanged = false,
   outside = [],
   elapsedSec = null,
+  expectedConversationId = null,
 }) {
   const errLines = String(stderr ?? '')
     .split(/\r?\n/)
@@ -1116,6 +1296,13 @@ export function judgeRun({
     return {
       exit: 3,
       reason: `Backend did not return JSON (exit=${code}): ${limitText(errHead, 200)}`,
+    };
+  }
+  if (expectedConversationId && parsed.conversationId !== expectedConversationId) {
+    return {
+      exit: 3,
+      reason:
+        'Follow-up did not resume the earlier conversation (the backend started a new one, without the protocol); dispatch a fresh job',
     };
   }
   if (!validRep && parsed.denied.length > 0) {
@@ -1160,6 +1347,12 @@ export function judgeRun({
       reason: `Read-only directory modified: ${roTouched.length} file(s) touched`,
     };
   }
+  if (contextChanged) {
+    return {
+      exit: 3,
+      reason: 'Shared context file was modified during the run',
+    };
+  }
   if (outside.length > 0) {
     return {
       exit: 3,
@@ -1189,6 +1382,8 @@ export function formatReport({
   missing,
   unreported,
   roTouched,
+  contextChanged = false,
+  contextFile = null,
   outside = [],
   claimed,
   platform = process.platform,
@@ -1230,7 +1425,7 @@ export function formatReport({
       missing.length +
       roTouched.length +
       outside.length >
-    0;
+      0 || Boolean(contextChanged);
   lines.push(`Files (measured by the dispatcher):${hasChanges ? '' : ' no changes'}`);
   for (const f of created) lines.push(`  + ${formatEntry(f)}`);
   for (const f of modified) lines.push(`  ~ ${formatEntry(f)}`);
@@ -1238,6 +1433,7 @@ export function formatReport({
   for (const f of missing) lines.push(`  ! reported but missing: ${f}`);
   for (const f of unreported) lines.push(`  ? changed but not reported: ${f}`);
   for (const f of roTouched) lines.push(`  !! read-only dir touched: ${f}`);
+  if (contextChanged) lines.push(`  !! shared context modified: ${contextFile ?? '(unknown)'}`);
   for (const f of outside) lines.push(`  !! written outside writable dirs: ${f}`);
 
   const denied = Array.isArray(parsed.deniedSteps) ? parsed.deniedSteps : [];
@@ -1298,6 +1494,34 @@ export function formatShortOutput(lines, reportMdPath) {
       : truncated;
   capped.push(`Full report: ${reportMdPath}`);
   return `${capped.join('\n')}\n`;
+}
+
+export function computeRoles({ backendStatus, modelStatus, configuredModel }) {
+  if (backendStatus !== 'OK') {
+    return {
+      worker: {
+        status: 'unavailable',
+        detail: 'not available; backup-worker (Sonnet) takes its jobs',
+      },
+      next: 'install the Antigravity CLI (see /brain-dispatch:setup), or carry on with the Claude-only roles.',
+    };
+  }
+  if (modelStatus !== 'OK') {
+    return {
+      worker: {
+        status: 'check-model',
+        detail: `agy found, but ${configuredModel} is not in "agy models"`,
+      },
+      next: 'pick a model from "agy models" and set worker.model in the config.',
+    };
+  }
+  return {
+    worker: {
+      status: 'ready',
+      detail: `ready (${configuredModel})`,
+    },
+    next: 'run the smoke test in /brain-dispatch:setup to confirm agy is signed in.',
+  };
 }
 
 export function getRepoRoot() {

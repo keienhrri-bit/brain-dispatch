@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
   BackendUnavailableError,
+  CONTEXT_LIMIT,
   DEFAULT_KILL_GRACE_SEC,
+  FALLBACK_HINT,
   ValidationError,
   buildBackendArgs,
   buildSettings,
@@ -26,6 +29,7 @@ import {
   parseWorkerArgs,
   reconcileReport,
   renderPrompt,
+  resolveFollowUp,
   selectPromptArg,
   stripBom,
   takeSnapshot,
@@ -40,6 +44,7 @@ const USAGE = `Usage: node scripts/worker.mjs --name <name> --task <task.md> --w
 Options:
   --name <name>                  Job name (letters, digits, '_', '-') [required]
   --task <file>                  Path to task brief markdown file [required]
+  --context <file>               Shared context file prepended to the brief (read-only for the worker)
   --workdir <dir>                Working directory (created if missing) [required]
   --read-dir <dir>               Read-only directory (repeatable or comma-separated)
   --write-dir <dir>              Extra writable directory (repeatable or comma-separated)
@@ -48,10 +53,20 @@ Options:
   --effort low|medium|high|xhigh Effort suffix for default model (default: from config)
   --model <model>                Full model ID override
   --web                          Allow web search and read_url
+  --follow-up <job>              Continue an earlier job (name or job directory) in the same conversation;
+                                 takes only --name, --task, --timeout-min and --dry-run
   --timeout-min <minutes>        Timeout in minutes (default: from config)
   --dry-run                      Print resolved settings/args without creating workdir or calling backend
   --help, -h                     Show this help message
 `;
+
+function hashFile(filePath) {
+  try {
+    return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+  } catch {
+    return null;
+  }
+}
 
 function killProcessTree(child, platform) {
   if (!child.pid) return;
@@ -155,7 +170,78 @@ async function main() {
     throw new ValidationError(`Task path is not a file: ${taskFile}`);
   }
 
-  const expandedReadDirs = opts.readDirs.map((d) => normalizePath(expandHome(d, homeDir), platform));
+  const followUp =
+    opts.followUp !== null
+      ? resolveFollowUp({ ref: opts.followUp, stateHome, platform })
+      : null;
+
+  const rawWorkDir = followUp ? followUp.workDir : opts.workdir;
+  const rawWriteDirs = followUp ? followUp.writeDirs : opts.writeDirs;
+  const rawReadDirs = followUp ? followUp.readDirs : opts.readDirs;
+  const rawProtect = followUp ? followUp.protect : opts.protect;
+  const access = followUp ? followUp.access : opts.access;
+  const web = followUp ? followUp.web : opts.web;
+  const resolvedModel = followUp
+    ? followUp.model || `${loaded.config.worker.model}-${loaded.config.worker.effort}`
+    : opts.resolvedModel;
+  const requestedContext = followUp ? followUp.contextFile : opts.context;
+  const cliProtect = uniquePaths(
+    rawProtect.map((d) => expandHome(d, homeDir)),
+    platform
+  );
+
+  if (followUp) {
+    const normWorkDir = normalizePath(expandHome(rawWorkDir, homeDir), platform);
+    let workStat;
+    try {
+      workStat = fs.statSync(normWorkDir);
+    } catch {
+      throw new ValidationError(
+        `Working directory of the earlier job no longer exists: ${normWorkDir}`
+      );
+    }
+    if (!workStat.isDirectory()) {
+      throw new ValidationError(
+        `Working directory of the earlier job no longer exists: ${normWorkDir}`
+      );
+    }
+  }
+
+  let contextFile = null;
+  let contextText = null;
+  if (requestedContext !== null) {
+    const candidateContext = normalizePath(expandHome(requestedContext, homeDir), platform);
+    let contextStat = null;
+    try {
+      contextStat = fs.statSync(candidateContext);
+    } catch (err) {
+      if (followUp && (err?.code === 'ENOENT' || err?.code === 'ENOTDIR')) {
+        contextStat = null;
+      } else {
+        throw new ValidationError(`Context file not found: ${candidateContext}`);
+      }
+    }
+    if (contextStat) {
+      if (!contextStat.isFile()) {
+        if (!followUp) {
+          throw new ValidationError(`Context file not found: ${candidateContext}`);
+        }
+      } else {
+        contextFile = candidateContext;
+        contextText = stripBom(fs.readFileSync(contextFile, 'utf8')).trim();
+        if (!contextText) {
+          throw new ValidationError(`Context file is empty: ${contextFile}`);
+        }
+        if (contextText.length > CONTEXT_LIMIT) {
+          throw new ValidationError(
+            `Context file is ${contextText.length} characters; the limit is ${CONTEXT_LIMIT}. Trim it to what every job needs.`
+          );
+        }
+      }
+    }
+  }
+
+  const expandedReadDirs = rawReadDirs.map((d) => normalizePath(expandHome(d, homeDir), platform));
   for (const r of expandedReadDirs) {
     let st;
     try {
@@ -169,21 +255,29 @@ async function main() {
   }
 
   const dirs = validateDirectories({
-    workDir: opts.workdir,
-    writeDirs: opts.writeDirs,
+    workDir: rawWorkDir,
+    writeDirs: rawWriteDirs,
     readDirs: expandedReadDirs,
     configProtect: loaded.config.protect,
-    cliProtect: opts.protect,
-    access: opts.access,
+    cliProtect,
+    access,
     homeDir,
     stateHome,
     platform,
   });
 
-  const templatePath = path.join(repoRoot, 'templates', 'worker-protocol.md');
+  const templatePath = path.join(
+    repoRoot,
+    'templates',
+    followUp ? 'follow-up.md' : 'worker-protocol.md'
+  );
   const schemaFile = path.join(repoRoot, 'schemas', 'report.schema.json');
   if (!fs.existsSync(templatePath)) {
-    throw new ValidationError(`Protocol template not found: ${templatePath}`);
+    throw new ValidationError(
+      followUp
+        ? `Follow-up template not found: ${templatePath}`
+        : `Protocol template not found: ${templatePath}`
+    );
   }
   if (!fs.existsSync(schemaFile)) {
     throw new ValidationError(`Report schema not found: ${schemaFile}`);
@@ -201,9 +295,12 @@ async function main() {
   }
 
   const settings = buildSettings({
-    access: opts.access,
-    web: opts.web,
-    writeDeny: dirs.writeDeny,
+    access,
+    web,
+    // The worker's file tools may not write the shared context file, even when
+    // it sits inside a writable directory. The hash check after the run still
+    // catches a change made some other way (a command at full access).
+    writeDeny: contextFile ? [...dirs.writeDeny, contextFile] : dirs.writeDeny,
     writable: dirs.writable,
   });
 
@@ -222,8 +319,10 @@ async function main() {
     workDir: dirs.workDir,
     writable: dirs.writable,
     readDirs: dirs.readDirs,
-    access: opts.access,
-    web: opts.web,
+    access,
+    web,
+    contextText,
+    contextFile,
   });
 
   const promptFile = path.join(jobDir, 'prompt.md');
@@ -232,30 +331,40 @@ async function main() {
   const promptArg = selectPromptArg(prompt, promptFile);
   const argv = buildBackendArgs({
     promptArg,
-    model: opts.resolvedModel,
+    model: resolvedModel,
     settingsFile,
     schemaFile,
     timeoutMin: opts.timeoutMin,
-    access: opts.access,
+    access,
+    conversationId: followUp ? followUp.conversationId : null,
   });
 
   if (opts.dryRun) {
-    const out = [
-      `DRYRUN ${opts.name} | ${opts.resolvedModel} | ${opts.access}`,
+    const outLines = [
+      `DRYRUN ${opts.name} | ${resolvedModel} | ${access}`,
       `Job dir: ${jobDir}`,
+    ];
+    if (followUp) {
+      outLines.push(`Follow-up of: ${followUp.jobDir} (conversation ${followUp.conversationId})`);
+    }
+    outLines.push(
       'Settings:',
       JSON.stringify(settings, null, 2),
-      `Args: ${argv.slice(2).join(' ')}`,
-      `Prompt: ${prompt.length} chars (${promptFile})`,
-    ].join('\n');
-    process.stdout.write(`${out}\n`);
+      `Args: ${argv.slice(2).join(' ')}`
+    );
+    if (contextFile) {
+      outLines.push(`Context: ${contextFile} (${contextText.length} chars)`);
+    }
+    outLines.push(`Prompt: ${prompt.length} chars (${promptFile})`);
+    process.stdout.write(`${outLines.join('\n')}\n`);
     process.exit(0);
   }
 
   const watchRW = uniquePaths([dirs.workDir, ...dirs.writeDirs], platform);
-  const watchRO = opts.access === 'full' ? dirs.readDirs : [];
+  const watchRO = access === 'full' ? dirs.readDirs : [];
   const beforeRW = takeSnapshot(watchRW, platform);
   const beforeRO = takeSnapshot(watchRO, platform);
+  const beforeContextHash = contextFile ? hashFile(contextFile) : null;
 
   const proxyUrl = await resolveBackendProxy({
     configProxy: loaded.config.proxy,
@@ -298,6 +407,11 @@ async function main() {
 
   const afterRW = takeSnapshot(watchRW, platform);
   const afterRO = takeSnapshot(watchRO, platform);
+  const afterContextHash = contextFile ? hashFile(contextFile) : null;
+  const contextChanged = Boolean(
+    contextFile &&
+      (beforeContextHash === null || afterContextHash === null || afterContextHash !== beforeContextHash)
+  );
   const { created, modified, deleted } = diffSnapshots(beforeRW, afterRW);
   const roTouched = diffReadOnly(beforeRO, afterRO);
 
@@ -326,14 +440,16 @@ async function main() {
     parsed,
     missing,
     roTouched,
+    contextChanged,
     outside,
     elapsedSec,
+    expectedConversationId: followUp ? followUp.conversationId : null,
   });
 
   const { lines, reportText } = formatReport({
     name: opts.name,
-    model: opts.resolvedModel,
-    access: opts.access,
+    model: resolvedModel,
+    access,
     secs,
     reason,
     parsed,
@@ -343,6 +459,8 @@ async function main() {
     missing,
     unreported,
     roTouched,
+    contextChanged,
+    contextFile,
     outside,
     claimed,
     platform,
@@ -362,9 +480,11 @@ async function main() {
     name: opts.name,
     agent: 'worker',
     backend: 'agy',
-    model: opts.resolvedModel,
-    access: opts.access,
-    web: Boolean(opts.web),
+    model: resolvedModel,
+    access,
+    web: Boolean(web),
+    follow_up_of: followUp ? followUp.jobDir : null,
+    protect: cliProtect,
     ok: !reason,
     reason,
     exit,
@@ -376,6 +496,8 @@ async function main() {
     write_dir: dirs.writeDirs,
     read_dir: dirs.readDirs,
     task_file: taskFile,
+    context_file: contextFile,
+    context_changed: contextChanged,
     created,
     modified,
     deleted,
@@ -397,8 +519,8 @@ async function main() {
     name: opts.name,
     agent: 'worker',
     tried: ['worker'],
-    model: opts.resolvedModel,
-    mode: opts.access,
+    model: resolvedModel,
+    mode: access,
     ok: !reason,
     seconds: secs,
     attempts: 1,
@@ -414,6 +536,9 @@ async function main() {
   );
 
   process.stdout.write(formatShortOutput(lines, reportMdPath));
+  if (exit === 5) {
+    process.stdout.write(`${FALLBACK_HINT}\n`);
+  }
   process.exit(exit);
 }
 
@@ -424,6 +549,7 @@ main().catch((err) => {
   }
   if (err instanceof BackendUnavailableError) {
     process.stderr.write(`Error: ${err.message}\n`);
+    process.stderr.write(`${FALLBACK_HINT}\n`);
     process.exit(5);
   }
   process.stderr.write(`Error: ${err?.stack || err?.message || String(err)}\n`);
